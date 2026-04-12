@@ -1,18 +1,15 @@
 {
-  "name": "canvas-react-app",
-  "private": true,
-  "version": "0.0.0",
+  "name": "canvas-app",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "build": "vite build"
   },
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "lucide-react": "^0.290.0",
-    "firebase": "^10.5.0"
+    "firebase": "^10.5.0",
+    "@google/generative-ai": "^0.2.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.1.0",
