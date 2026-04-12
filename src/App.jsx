@@ -1,7 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
-  getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged 
+  getAuth, 
+  signInWithEmailAndPassword, 
+  signOut, 
+  onAuthStateChanged 
 } from 'firebase/auth';
 import { 
   getFirestore, collection, doc, onSnapshot, getDoc,
@@ -11,9 +14,10 @@ import {
   Camera, Image as ImageIcon, PlusCircle, Package, ShoppingCart, 
   TrendingUp, Plus, Minus, Trash2, Loader2, CheckCircle2, 
   AlertTriangle, Edit3, Save, BellRing, History, X, 
-  ListPlus, Tag, Zap, Search, DollarSign, Store, Clock, 
-  ChevronDown, ChevronUp, Settings, Sparkles, Filter, 
-  ArrowUpDown, User, Lock, LogOut, LineChart, Database
+  ListPlus, Tag, PieChart, Calendar, Zap, Search, 
+  DollarSign, Store, Clock, ChevronDown, ChevronUp, Settings,
+  Sparkles, Filter, ArrowUpDown, User, Lock, LogOut, LineChart,
+  Database
 } from 'lucide-react';
 
 const firebaseConfig = {
@@ -30,9 +34,10 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = "home-stock-assistant";
 
-const apiKey = ""; 
+// ⚠️ 請填入您的 Gemini API Key
+const apiKey = import.meta.env.VITE_GEMINI_API_KEY; 
 
-const commonUnits = ['件', '包', '支', '排', '盒', '罐', '瓶', '袋'];
+const commonUnits = ['件', '包', '支', '排', '盒', '罐', '樽', '袋'];
 const commonSuppliers = ['不限', 'HKTVmall', '百佳', '惠康', '萬寧', '屈臣氏', 'DONKI'];
 
 const fetchWithRetry = async (url, options, retries = 5, delay = 1000) => {
@@ -75,6 +80,7 @@ const App = () => {
   
   const [filterCat, setFilterCat] = useState('All');
   const [sortBy, setSortBy] = useState('name'); 
+  
   const [analysisFilterCat, setAnalysisFilterCat] = useState('All');
   const [analysisSortBy, setAnalysisSortBy] = useState('daysAsc');
 
@@ -82,7 +88,6 @@ const App = () => {
   const [confirmDialog, setConfirmDialog] = useState(null);
 
   const [modalMode, setModalMode] = useState(null); 
-  // 為了支援順利輸入小數點，表單數值預設皆以「字串」狀態保存
   const [itemForm, setItemForm] = useState({ id: null, name: '', category: '未分類', unit: '件', stock: '1', min: '2', track_price: false });
   
   const [adjustStockModal, setAdjustStockModal] = useState(null);
@@ -139,6 +144,7 @@ const App = () => {
 
   useEffect(() => {
     if (!user) return;
+    
     const unsubscribeSettings = onSnapshot(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'preferences'), (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
@@ -176,7 +182,6 @@ const App = () => {
   const uniqueItemCats = items.map(i => i.category).filter(Boolean);
   const allCategoryNames = Array.from(new Set([...categories.map(c => c.name), ...uniqueItemCats]));
 
-  // 確保採購數量皆為整數
   useEffect(() => {
     const newAmounts = { ...purchaseAmounts };
     let changed = false;
@@ -249,8 +254,8 @@ const App = () => {
     if (filterCat !== 'All') filtered = filtered.filter(i => i.category === filterCat);
     filtered.sort((a, b) => {
       if (sortBy === 'name') return (a.display_name || '').localeCompare(b.display_name || '', 'zh-TW');
-      if (sortBy === 'stockAsc') return (a.current_stock || 0) - (b.current_stock || 0);
-      if (sortBy === 'stockDesc') return (b.current_stock || 0) - (a.current_stock || 0);
+      if (sortBy === 'stockAsc') return (Number(a.current_stock) || 0) - (Number(b.current_stock) || 0);
+      if (sortBy === 'stockDesc') return (Number(b.current_stock) || 0) - (Number(a.current_stock) || 0);
       if (sortBy === 'recent') return (b.last_updated?.seconds || 0) - (a.last_updated?.seconds || 0);
       return 0;
     });
@@ -269,15 +274,25 @@ const App = () => {
 
       if (logs.length > 0) {
         const firstLogDate = new Date(logs[0].logged_at?.seconds * 1000);
-        const daysSinceFirstLog = Math.max(1, (now - firstLogDate) / (1000 * 60 * 60 * 24));
+        // 算出精確的天數差，最低為 1 避免除以 0 無限大
+        let daysSinceFirstLog = (now - firstLogDate) / (1000 * 60 * 60 * 24);
+        if (daysSinceFirstLog < 1) daysSinceFirstLog = 1; 
+        
         const totalConsumed = logs.reduce((sum, log) => sum + (Number(log.consumed_qty) || 0), 0);
         
         if (totalConsumed > 0) {
           const dailyUsage = totalConsumed / daysSinceFirstLog;
-          const monthlyUsage = Math.round(dailyUsage * 30 * 10) / 10; 
-          const daysLeft = dailyUsage > 0 ? Math.floor(item.current_stock / dailyUsage) : 999;
+          const monthlyUsage = Number((dailyUsage * 30).toFixed(1)); 
+          const daysLeft = dailyUsage > 0 ? Math.floor(Number(item.current_stock) / dailyUsage) : 999;
           
-          insights.push({ ...item, monthlyUsage, daysLeft, status: daysLeft <= 7 ? 'critical' : daysLeft <= 14 ? 'warning' : 'good' });
+          insights.push({
+            ...item,
+            monthlyUsage,
+            daysLeft,
+            status: daysLeft <= 7 ? 'critical' : daysLeft <= 14 ? 'warning' : 'good',
+            debug_days: Number(daysSinceFirstLog.toFixed(1)),
+            debug_consumed: Number(totalConsumed.toFixed(2))
+          });
         }
       }
     });
@@ -302,32 +317,22 @@ const App = () => {
   
   const displayedInsights = getDisplayedInsights(); 
 
-  // --- 智能調整庫存 (支援小數點) ---
-  const handleConfirmAdjustment = async () => {
-    if (!user || !adjustStockModal) return;
+  // --- 💡 任何減少都會紀錄：包含主畫面的加減號 ---
+  const updateStock = async (id, delta) => {
+    const item = items.find(i => i.id === id);
+    if (!item) return;
     
-    const item = adjustStockModal;
-    const newStock = Number(adjustAmount);
-    
-    if (isNaN(newStock) || newStock < 0) {
-      showToast('請輸入有效的數字');
-      return;
-    }
+    const currentStock = Number(item.current_stock) || 0;
+    const newStock = Math.max(0, Number((currentStock + delta).toFixed(2)));
+    const actualDelta = Number((newStock - currentStock).toFixed(2));
 
-    const delta = Number((newStock - item.current_stock).toFixed(2));
-
-    if (delta === 0) {
-      setAdjustStockModal(null);
-      return;
-    }
-
-    await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', item.id), {
-      current_stock: newStock,
-      last_updated: serverTimestamp()
+    await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', id), {
+      current_stock: newStock, last_updated: serverTimestamp()
     });
 
-    if (delta < 0) {
-      const consumed = Math.abs(delta);
+    // 只要有實質消耗 (actualDelta < 0)，就自動寫入紀錄庫供預測
+    if (actualDelta < 0) {
+      const consumed = Math.abs(actualDelta);
       await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'usage_logs'), {
         item_id: item.id,
         item_name: item.display_name,
@@ -336,10 +341,24 @@ const App = () => {
         logged_at: serverTimestamp()
       });
       showToast(`已記錄消耗 ${consumed} ${item.unit || '件'}`);
-    } else {
-      showToast(`庫存已增加 ${delta} ${item.unit || '件'}`);
     }
+  };
 
+  const handleConfirmAdjustment = async () => {
+    if (!user || !adjustStockModal) return;
+    const item = adjustStockModal;
+    const newStock = Number(adjustAmount);
+    
+    if (isNaN(newStock) || newStock < 0) {
+      showToast('請輸入有效的數字');
+      return;
+    }
+    const delta = Number((newStock - item.current_stock).toFixed(2));
+    if (delta === 0) {
+      setAdjustStockModal(null);
+      return;
+    }
+    await updateStock(item.id, delta);
     setAdjustStockModal(null);
   };
 
@@ -371,6 +390,7 @@ const App = () => {
       });
       setScanResult({ status: 'success', data: JSON.parse(result.candidates[0].content.parts[0].text) });
     } catch (err) { 
+      console.error(err);
       setScanResult({ status: 'error', message: `辨識失敗: 網路異常或影像不清，請手動輸入。` }); 
     }
   };
@@ -435,9 +455,7 @@ const App = () => {
     if (modalMode === 'add') {
       const exactMatch = items.find(i => i.display_name.toLowerCase() === itemForm.name.trim().toLowerCase());
       if (exactMatch) {
-        await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', exactMatch.id), {
-          current_stock: Number((exactMatch.current_stock + finalStock).toFixed(2)), last_updated: serverTimestamp()
-        });
+        await updateStock(exactMatch.id, finalStock);
         showToast(`物品已完全吻合！自動為「${exactMatch.display_name}」增加庫存`);
       } else {
         await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'inventory'), {
@@ -585,7 +603,8 @@ const App = () => {
         }
       ]`;
       
-      const result = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+      // 使用 gemini-2.5-flash 正式版模型
+      const result = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], tools: [{ google_search: {} }] })
       });
@@ -613,7 +632,7 @@ const App = () => {
     } catch (err) { 
       let errMsg = "搜尋失敗，請稍後再試。";
       if (err.message.includes('400')) errMsg = "API 請求格式錯誤，請確認 Gemini 搜尋功能已開通。";
-      if (err.message.includes('401') || err.message.includes('403')) errMsg = "API 授權失敗，請確認已正確填寫 API Key 且具有搜尋權限。";
+      if (err.message.includes('401') || err.message.includes('403')) errMsg = "API 授權失敗，請確認已正確填寫 API Key。";
       showToast(errMsg); 
     } finally { 
       setIsSearchingDeals(false); 
@@ -627,9 +646,9 @@ const App = () => {
       const lowStock = items.filter(i => i.current_stock <= i.min_stock).map(i => i.display_name);
       const inventoryList = items.map(i => `${i.display_name}(${i.current_stock} ${i.unit || '件'})`).join(', ');
       
-      const response = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+      const response = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: `目前的低庫存：${lowStock.join(', ')}。所有庫存：${inventoryList}。請提供簡短的家庭管理建議或可能的晚餐食譜建議。` }] }] })
+        body: JSON.stringify({ contents: [{ parts: [{ text: `目前的低庫存：${lowStock.join(', ')}。所有庫存：${inventoryList}。請注意括號內是物品的真實數量與單位，例如「2 排雞蛋」代表2排而不是2隻。請提供簡短的家庭管理建議或可能的晚餐食譜建議。` }] }] })
       });
       setAiAdvice(response.candidates?.[0]?.content?.parts?.[0]?.text || "暫無分析建議");
     } catch (err) { 
@@ -643,7 +662,6 @@ const App = () => {
     return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
   };
 
-  // --- 登入畫面 ---
   if (authChecking) return <div className="min-h-screen flex items-center justify-center bg-slate-50"><Loader2 className="animate-spin text-indigo-600" size={40} /></div>;
 
   if (!user) {
@@ -690,7 +708,7 @@ const App = () => {
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 pb-24 font-sans relative">
       
-      {/* 🌟 Toast - 最上層 z-[200] */}
+      {/* 🌟 Toast */}
       {toast && (
         <div className="fixed top-16 left-1/2 -translate-x-1/2 z-[200] bg-slate-800 text-white px-6 py-3 rounded-full shadow-2xl flex items-center gap-2 animate-in slide-in-from-top-4 w-11/12 max-w-sm">
           <CheckCircle2 size={18} className="text-emerald-400 shrink-0" />
@@ -698,7 +716,7 @@ const App = () => {
         </div>
       )}
 
-      {/* 🌟 Confirm Dialog z-[100] */}
+      {/* 🌟 Confirm Dialog */}
       {confirmDialog && (
         <div className="fixed inset-0 z-[100] bg-black/60 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in">
           <div className="bg-white rounded-3xl p-6 w-full max-w-xs shadow-2xl">
@@ -713,14 +731,14 @@ const App = () => {
         </div>
       )}
 
-      {/* --- 🎯 防誤觸數量調整 Modal (完美支援小數輸入) z-[80] --- */}
+      {/* --- 🎯 防誤觸數量調整 Modal (完美支援小數輸入) --- */}
       {adjustStockModal && (
         <div className="fixed inset-0 z-[80] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in">
           <div className="bg-white rounded-3xl p-6 w-full max-w-xs shadow-2xl relative">
              <button onClick={() => setAdjustStockModal(null)} className="absolute top-4 right-4 text-slate-400 bg-slate-50 rounded-full p-1"><X size={18}/></button>
              
              <div className="mb-4">
-                <span className="text-[10px] text-slate-500 font-bold bg-slate-100 px-2 py-1 rounded-md mb-2 inline-block">調整庫存</span>
+                <span className="text-[10px] text-slate-500 font-bold bg-slate-100 px-2 py-1 rounded-md mb-2 inline-block">庫存調整</span>
                 <h3 className="text-xl font-black text-slate-800 leading-tight pr-6">{adjustStockModal.display_name}</h3>
                 <p className="text-xs text-slate-500 mt-1">目前有：{adjustStockModal.current_stock} {adjustStockModal.unit}</p>
              </div>
@@ -742,7 +760,7 @@ const App = () => {
 
              <div className="flex gap-2">
                <button onClick={() => setAdjustAmount('0')} className="bg-slate-100 text-slate-500 px-4 rounded-xl font-bold text-xs whitespace-nowrap active:bg-slate-200">歸零</button>
-               <button onClick={handleConfirmAdjustment} className="flex-1 bg-indigo-600 text-white py-3.5 rounded-xl font-black text-sm shadow-md shadow-indigo-600/30 active:scale-95">確認</button>
+               <button onClick={handleConfirmAdjustment} className="flex-1 bg-indigo-600 text-white py-3.5 rounded-xl font-black text-sm shadow-md shadow-indigo-600/30 active:scale-95">確認變更</button>
              </div>
           </div>
         </div>
@@ -761,7 +779,7 @@ const App = () => {
         </div>
       </header>
 
-      {/* --- 個人設定 Modal z-[70] --- */}
+      {/* --- 個人設定 Modal --- */}
       {isSettingsOpen && (
          <div className="fixed inset-0 z-[70] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in">
             <div className="bg-white rounded-3xl p-6 w-full max-w-xs shadow-2xl relative">
@@ -798,7 +816,7 @@ const App = () => {
          </div>
       )}
 
-      {/* --- 管理消耗紀錄 Modal z-[70] --- */}
+      {/* --- 管理消耗紀錄 Modal --- */}
       {isUsageLogsOpen && (
          <div className="fixed inset-0 z-[70] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in">
             <div className="bg-white rounded-3xl p-5 w-full max-w-sm shadow-2xl relative max-h-[80vh] flex flex-col">
@@ -885,20 +903,27 @@ const App = () => {
                       </div>
                       
                       <div className="flex gap-1.5 items-center">
-                        {/* 🌟 橫向顯示數量的按鈕 (防誤觸設計，點擊開啟彈窗) */}
+                        <button 
+                          onClick={() => updateStock(item.id, -0.5)} 
+                          className="w-7 h-8 flex items-center justify-center text-slate-400 active:bg-slate-200 rounded-md bg-slate-50 border border-slate-100"
+                        >
+                          <Minus size={14}/>
+                        </button>
+
+                        {/* 🌟 點擊數字開啟微調面板 */}
                         <button 
                           onClick={() => { setAdjustStockModal(item); setAdjustAmount(String(item.current_stock)); }} 
-                          className="bg-slate-50 hover:bg-indigo-50 border border-slate-100 rounded-lg px-3 py-1.5 flex flex-row items-baseline justify-center transition-colors shadow-sm active:scale-95 gap-1"
+                          className="hover:bg-indigo-50 rounded-lg px-1 flex flex-col items-center justify-center transition-colors active:scale-95"
                         >
                           <span className={`font-black text-base leading-none ${item.current_stock <= item.min_stock ? 'text-orange-500' : 'text-slate-800'}`}>{item.current_stock}</span>
-                          <span className="text-[10px] font-bold text-slate-500 leading-none">{item.unit || '件'}</span>
+                          <span className="text-[8px] font-bold text-slate-400 leading-none mt-0.5">{item.unit || '件'}</span>
                         </button>
 
                         <button 
-                          onClick={() => toggleShoppingList(item.id, !item.in_shopping_list)} 
-                          className={`w-8 h-8 flex items-center justify-center rounded-lg transition-colors ${item.in_shopping_list ? 'bg-emerald-50 text-emerald-500' : 'bg-slate-50 text-slate-400 hover:bg-indigo-50 hover:text-indigo-500'}`}
+                          onClick={() => updateStock(item.id, 0.5)} 
+                          className="w-7 h-8 flex items-center justify-center text-slate-400 active:bg-slate-200 rounded-md bg-slate-50 border border-slate-100"
                         >
-                          {item.in_shopping_list ? <CheckCircle2 size={16}/> : <ShoppingCart size={16}/>}
+                          <Plus size={14}/>
                         </button>
                       </div>
                     </div>
@@ -956,7 +981,7 @@ const App = () => {
                                <span className="font-bold text-slate-800 text-sm">{insight.display_name}</span>
                                {insight.status === 'critical' && <span className="bg-red-50 text-red-500 text-[8px] font-black px-1.5 py-0.5 rounded">即將用罄</span>}
                             </div>
-                            <p className="text-[10px] text-slate-500">預估月消耗：{insight.monthlyUsage} {insight.unit || '件'}</p>
+                            <p className="text-[10px] text-slate-500">已紀錄：{insight.debug_days} 天用 {insight.debug_consumed} {insight.unit} (約 {insight.monthlyUsage}/月)</p>
                          </div>
                          <div className="text-right">
                             <p className="text-[10px] text-slate-400 mb-0.5">預計可用</p>
@@ -1023,9 +1048,9 @@ const App = () => {
                            <div className="flex items-center justify-between pt-3 border-t border-white/10">
                               <span className="text-xs text-slate-300 pr-2 leading-tight">{deal.reason}</span>
                               {deal.recommendBuy ? (
-                                 <span className="shrink-0 bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-1 rounded-lg text-[10px] font-black flex items-center gap-0.5"><CheckCircle2 size={12}/> 建議</span>
+                                 <span className="shrink-0 bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-1 rounded-lg text-[10px] font-black flex items-center gap-0.5"><CheckCircle2 size={12}/> 建議購入</span>
                               ) : (
-                                 <span className="shrink-0 bg-slate-500/20 text-slate-300 border border-slate-500/30 px-2 py-1 rounded-lg text-[10px] font-bold">觀望</span>
+                                 <span className="shrink-0 bg-slate-500/20 text-slate-300 border border-slate-500/30 px-2 py-1 rounded-lg text-[10px] font-bold">暫可觀望</span>
                               )}
                            </div>
 
@@ -1034,17 +1059,18 @@ const App = () => {
                                 onClick={() => setShowAlts(prev => ({...prev, [deal.id]: !prev[deal.id]}))}
                                 className="text-[10px] text-slate-400 flex items-center gap-0.5 hover:text-white"
                               >
-                                {deal.alternatives?.length > 0 ? (showAlts[deal.id] ? <><ChevronUp size={12}/> 收起</> : <><ChevronDown size={12}/> 其他</>) : '無其他'}
+                                {deal.alternatives?.length > 0 ? (showAlts[deal.id] ? <><ChevronUp size={12}/> 收起其他</> : <><ChevronDown size={12}/> 其他報價</>) : '無其他報價'}
                               </button>
                               
                               {linkedItem && !linkedItem.in_shopping_list && (
-                                 <button onClick={() => toggleShoppingList(linkedItem.id, true)} className="bg-indigo-500 text-white px-2 py-1 rounded text-[9px] font-black flex items-center gap-0.5 shadow-md active:scale-95"><ShoppingCart size={10}/> 加入採購</button>
+                                 <button onClick={() => toggleShoppingList(linkedItem.id, true)} className="bg-indigo-500 text-white px-2 py-1 rounded text-[9px] font-black flex items-center gap-0.5 shadow-md active:scale-95"><ShoppingCart size={10}/> 加採購單</button>
                               )}
                               {linkedItem && linkedItem.in_shopping_list && (
                                  <span className="text-[9px] text-emerald-400 flex items-center gap-0.5"><CheckCircle2 size={10}/> 已在清單</span>
                               )}
                            </div>
 
+                           {/* 展開其他報價 */}
                            {showAlts[deal.id] && deal.alternatives?.length > 0 && (
                              <div className="mt-1 pt-2 border-t border-dashed border-white/10 space-y-1.5 animate-in slide-in-from-top-2">
                                {deal.alternatives.map((alt, i) => (
@@ -1135,7 +1161,7 @@ const App = () => {
           </div>
         )}
 
-        {/* --- 共用新增/編輯 Modal (完美支援小數點輸入) z-50 --- */}
+        {/* --- 共用新增/編輯 Modal --- */}
         {modalMode && (
           <div className="fixed inset-0 z-[90] bg-black/60 backdrop-blur-sm flex items-end sm:items-center p-0 sm:p-4 animate-in fade-in">
              <div className="bg-white rounded-t-3xl sm:rounded-3xl p-5 w-full max-w-sm relative max-h-[90vh] overflow-y-auto animate-in slide-in-from-bottom-full duration-300 mx-auto">
@@ -1196,7 +1222,6 @@ const App = () => {
 
                    <button onClick={saveItemForm} className="w-full bg-indigo-600 text-white py-3.5 rounded-xl font-bold text-sm shadow-md active:scale-95">確認儲存</button>
                    
-                   {/* 刪除按鈕 */}
                    {modalMode === 'edit' && (
                      <button 
                        onClick={() => triggerDelete('刪除物品', `確定要永久刪除「${itemForm.name}」嗎？`, () => {
@@ -1213,7 +1238,7 @@ const App = () => {
           </div>
         )}
 
-        {/* --- 類別管理 Modal (管理所有類別) z-[100] --- */}
+        {/* --- 類別管理 Modal (管理所有類別) --- */}
         {isManagingCats && (
            <div className="fixed inset-0 z-[100] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in">
               <div className="bg-white rounded-3xl p-5 w-full max-w-xs shadow-2xl relative">
@@ -1250,7 +1275,7 @@ const App = () => {
            </div>
         )}
 
-        {/* 相機介面 (改為成功後打開表單) */}
+        {/* 相機介面 */}
         {isScanning && (
           <div className="fixed inset-0 z-50 bg-black flex flex-col p-6 animate-in fade-in">
              <div className="relative aspect-[3/4] w-full max-w-sm mx-auto rounded-3xl overflow-hidden border-2 border-indigo-400 mt-4">
