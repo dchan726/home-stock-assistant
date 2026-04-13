@@ -1,10 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
-  getAuth, 
-  signInWithEmailAndPassword, 
-  signOut, 
-  onAuthStateChanged 
+  getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged 
 } from 'firebase/auth';
 import { 
   getFirestore, collection, doc, onSnapshot, getDoc,
@@ -14,10 +11,9 @@ import {
   Camera, Image as ImageIcon, PlusCircle, Package, ShoppingCart, 
   TrendingUp, Plus, Minus, Trash2, Loader2, CheckCircle2, 
   AlertTriangle, Edit3, Save, BellRing, History, X, 
-  ListPlus, Tag, PieChart, Calendar, Zap, Search, 
-  DollarSign, Store, Clock, ChevronDown, ChevronUp, Settings,
-  Sparkles, Filter, ArrowUpDown, User, Lock, LogOut, LineChart,
-  Database
+  ListPlus, Tag, Zap, Search, DollarSign, Store, Clock, 
+  ChevronDown, ChevronUp, Settings, Sparkles, Filter, 
+  ArrowUpDown, User, Lock, LogOut, LineChart, Database
 } from 'lucide-react';
 
 const firebaseConfig = {
@@ -78,10 +74,13 @@ const App = () => {
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('inventory');
   
-  const [filterCat, setFilterCat] = useState('All');
+  // 🌟 改為支援多選分類的過濾狀態
+  const [filterCats, setFilterCats] = useState([]); 
+  const [isFilterOpen, setIsFilterOpen] = useState(false);
   const [sortBy, setSortBy] = useState('name'); 
   
-  const [analysisFilterCat, setAnalysisFilterCat] = useState('All');
+  const [analysisFilterCats, setAnalysisFilterCats] = useState([]);
+  const [isAnalysisFilterOpen, setIsAnalysisFilterOpen] = useState(false);
   const [analysisSortBy, setAnalysisSortBy] = useState('daysAsc');
 
   const [toast, setToast] = useState(null);
@@ -249,9 +248,12 @@ const App = () => {
     });
   };
 
+  // 🌟 升級版多分類過濾
   const getDisplayedItems = () => {
     let filtered = [...items];
-    if (filterCat !== 'All') filtered = filtered.filter(i => i.category === filterCat);
+    if (filterCats.length > 0) {
+      filtered = filtered.filter(i => filterCats.includes(i.category));
+    }
     filtered.sort((a, b) => {
       if (sortBy === 'name') return (a.display_name || '').localeCompare(b.display_name || '', 'zh-TW');
       if (sortBy === 'stockAsc') return (Number(a.current_stock) || 0) - (Number(b.current_stock) || 0);
@@ -273,8 +275,10 @@ const App = () => {
         .sort((a, b) => (a.logged_at?.seconds || 0) - (b.logged_at?.seconds || 0));
 
       if (logs.length > 0) {
-        const firstLogDate = new Date(logs[0].logged_at?.seconds * 1000);
-        // 算出精確的天數差，最低為 1 避免除以 0 無限大
+        const firstLogDate = logs[0].previous_last_updated 
+          ? new Date(logs[0].previous_last_updated.seconds * 1000) 
+          : new Date(logs[0].logged_at?.seconds * 1000);
+          
         let daysSinceFirstLog = (now - firstLogDate) / (1000 * 60 * 60 * 24);
         if (daysSinceFirstLog < 1) daysSinceFirstLog = 1; 
         
@@ -285,10 +289,14 @@ const App = () => {
           const monthlyUsage = Number((dailyUsage * 30).toFixed(1)); 
           const daysLeft = dailyUsage > 0 ? Math.floor(Number(item.current_stock) / dailyUsage) : 999;
           
+          const depletionDate = new Date(now.getTime() + daysLeft * 24 * 60 * 60 * 1000);
+          const depletionDateString = `${depletionDate.getFullYear()}年${depletionDate.getMonth() + 1}月${depletionDate.getDate()}日`;
+          
           insights.push({
             ...item,
             monthlyUsage,
             daysLeft,
+            depletionDateString,
             status: daysLeft <= 7 ? 'critical' : daysLeft <= 14 ? 'warning' : 'good',
             debug_days: Number(daysSinceFirstLog.toFixed(1)),
             debug_consumed: Number(totalConsumed.toFixed(2))
@@ -303,8 +311,8 @@ const App = () => {
 
   const getDisplayedInsights = () => {
     let filteredInsights = [...usageInsights];
-    if (analysisFilterCat !== 'All') {
-      filteredInsights = filteredInsights.filter(i => i.category === analysisFilterCat);
+    if (analysisFilterCats.length > 0) {
+      filteredInsights = filteredInsights.filter(i => analysisFilterCats.includes(i.category));
     }
     filteredInsights.sort((a, b) => {
       if (analysisSortBy === 'daysAsc') return a.daysLeft - b.daysLeft;
@@ -317,20 +325,19 @@ const App = () => {
   
   const displayedInsights = getDisplayedInsights(); 
 
-  // --- 💡 任何減少都會紀錄：包含主畫面的加減號 ---
   const updateStock = async (id, delta) => {
     const item = items.find(i => i.id === id);
     if (!item) return;
     
     const currentStock = Number(item.current_stock) || 0;
+    const previousLastUpdated = item.last_updated; 
     const newStock = Math.max(0, Number((currentStock + delta).toFixed(2)));
     const actualDelta = Number((newStock - currentStock).toFixed(2));
 
     await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', id), {
-      current_stock: newStock, last_updated: serverTimestamp()
+      current_stock: newStock, last_updated: serverTimestamp() // 💡 只有更動庫存時才會更新 last_updated
     });
 
-    // 只要有實質消耗 (actualDelta < 0)，就自動寫入紀錄庫供預測
     if (actualDelta < 0) {
       const consumed = Math.abs(actualDelta);
       await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'usage_logs'), {
@@ -338,7 +345,9 @@ const App = () => {
         item_name: item.display_name,
         consumed_qty: consumed,
         unit: item.unit || '件',
-        logged_at: serverTimestamp()
+        logged_at: serverTimestamp(),
+        previous_stock: currentStock,
+        previous_last_updated: previousLastUpdated || null
       });
       showToast(`已記錄消耗 ${consumed} ${item.unit || '件'}`);
     }
@@ -362,14 +371,43 @@ const App = () => {
     setAdjustStockModal(null);
   };
 
-  const saveUsageLogEdit = async (logId) => {
+  const handleDeleteUsageLog = async (log) => {
+    await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'usage_logs', log.id));
+    
+    const itemToRestore = items.find(i => i.id === log.item_id);
+    if (itemToRestore) {
+      const restoredStock = Number((Number(itemToRestore.current_stock) + Number(log.consumed_qty)).toFixed(2));
+      const updatePayload = { current_stock: restoredStock };
+      
+      if (log.previous_last_updated !== undefined) {
+        updatePayload.last_updated = log.previous_last_updated;
+      }
+      await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', log.item_id), updatePayload);
+    }
+    showToast('已刪除紀錄，庫存與更新日期已還原');
+  };
+
+  const saveUsageLogEdit = async (log) => {
     const qty = Number(editingLogQty);
     if (isNaN(qty) || qty <= 0) { showToast('請輸入有效的數字'); return; }
-    await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'usage_logs', logId), {
+    
+    const oldQty = Number(log.consumed_qty);
+    const delta = Number((oldQty - qty).toFixed(2)); 
+    
+    await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'usage_logs', log.id), {
       consumed_qty: qty
     });
+    
+    const itemToRestore = items.find(i => i.id === log.item_id);
+    if (itemToRestore && delta !== 0) {
+       const newStock = Math.max(0, Number((Number(itemToRestore.current_stock) + delta).toFixed(2)));
+       await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', itemToRestore.id), {
+         current_stock: newStock
+       });
+    }
+    
     setEditingLogId(null);
-    showToast('消耗紀錄已更新');
+    showToast('消耗紀錄已更新，並同步修正庫存');
   };
 
   const processImageWithAI = async (base64Image) => {
@@ -390,7 +428,6 @@ const App = () => {
       });
       setScanResult({ status: 'success', data: JSON.parse(result.candidates[0].content.parts[0].text) });
     } catch (err) { 
-      console.error(err);
       setScanResult({ status: 'error', message: `辨識失敗: 網路異常或影像不清，請手動輸入。` }); 
     }
   };
@@ -455,7 +492,9 @@ const App = () => {
     if (modalMode === 'add') {
       const exactMatch = items.find(i => i.display_name.toLowerCase() === itemForm.name.trim().toLowerCase());
       if (exactMatch) {
-        await updateStock(exactMatch.id, finalStock);
+        await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', exactMatch.id), {
+          current_stock: Number((exactMatch.current_stock + finalStock).toFixed(2)), last_updated: serverTimestamp()
+        });
         showToast(`物品已完全吻合！自動為「${exactMatch.display_name}」增加庫存`);
       } else {
         await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'inventory'), {
@@ -466,9 +505,10 @@ const App = () => {
         showToast('已新增品項');
       }
     } else if (modalMode === 'edit') {
+      // 💡 修復：編輯模式不更新 last_updated，避免干擾消耗預測
       await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', itemForm.id), {
         display_name: itemForm.name.trim(), category: itemForm.category, unit: itemForm.unit || '件',
-        current_stock: finalStock, min_stock: finalMin, track_price: itemForm.track_price || false, last_updated: serverTimestamp()
+        min_stock: finalMin, track_price: itemForm.track_price || false
       });
       showToast('已儲存變更');
     }
@@ -502,7 +542,7 @@ const App = () => {
   const openModal = (mode, item = null) => {
     setModalMode(mode);
     if (mode === 'add') {
-      setItemForm({ id: null, name: '', category: filterCat !== 'All' ? filterCat : (allCategoryNames[0] || '未分類'), unit: '件', stock: '1', min: String(userSettings.defaultMinStock), track_price: false });
+      setItemForm({ id: null, name: '', category: filterCats.length === 1 ? filterCats[0] : (allCategoryNames[0] || '未分類'), unit: '件', stock: '1', min: String(userSettings.defaultMinStock), track_price: false });
     } else if (mode === 'edit' && item) {
       setItemForm({ id: item.id, name: item.display_name, category: item.category, unit: item.unit || '件', stock: String(item.current_stock), min: String(item.min_stock), track_price: item.track_price || false });
     }
@@ -510,8 +550,8 @@ const App = () => {
 
   const triggerDelete = (title, message, deleteAction) => {
     setConfirmDialog({ 
-      title, message, confirmText: '確定刪除', cancelText: '取消',
-      onConfirm: async () => { await deleteAction(); setConfirmDialog(null); showToast('已成功刪除'); }
+      title, message, confirmText: '確定', cancelText: '取消',
+      onConfirm: async () => { await deleteAction(); setConfirmDialog(null); showToast('操作已完成'); }
     });
   };
 
@@ -584,13 +624,14 @@ const App = () => {
     setIsSearchingDeals(true);
     try {
       const itemsData = itemsToQuery.map(i => `- ID:${i.id}, 名稱:${i.display_name}, 尋找單位:${i.unit}`).join('\n');
-      const prompt = `請聯網搜尋以下物品最新的價格與優惠（香港地區）。
-      ${preferredSupplier !== '不限' ? `⚠️ 請優先尋找【${preferredSupplier}】的報價。` : '請搜尋 HKTVmall, 百佳, 惠康, 萬寧, 屈臣氏等。'}
+      const prompt = `你是一個專業的香港網購比價助理。
+      ⚠️ 絕對指令1：不管你現在的伺服器 IP 在哪，你都必須強制聯網搜尋「香港地區」的商品資料，貨幣必須是 HKD。建議在搜尋關鍵字中強制加入「香港」或「Hong Kong」。
+      ⚠️ 絕對指令2：${preferredSupplier !== '不限' ? `使用者已指定優先供應商為【${preferredSupplier}】。你必須強制優先搜尋並回報該平台的價格，如果該平台有貨，JSON 中的 seller 必須是「${preferredSupplier}」。` : '請廣泛搜尋香港本地超市（如 HKTVmall, 百佳, 惠康, 萬寧, 屈臣氏, DONKI 等）。'}
       
-      物品清單：
+      請搜尋以下物品的最新香港價格：
       ${itemsData}
       
-      請回傳 JSON 陣列格式。必須確保它是有效的 JSON，不要加任何其他廢話或 Markdown 標籤。格式範例：
+      請只回傳 JSON 陣列格式。不要加任何其他廢話或 Markdown 標籤。格式範例：
       [
         {
           "id": "填入對應物品的ID",
@@ -603,7 +644,6 @@ const App = () => {
         }
       ]`;
       
-      // 使用 gemini-2.5-flash 正式版模型
       const result = await fetchWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], tools: [{ google_search: {} }] })
@@ -621,7 +661,7 @@ const App = () => {
           parsedDeals = JSON.parse(cleanText);
         }
       } catch (e) {
-        throw new Error("AI 回傳格式異常");
+        throw new Error("AI 回傳格式異常，無法解析為比價表");
       }
 
       await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'system_deals', 'latest'), {
@@ -630,9 +670,9 @@ const App = () => {
       showToast("✅ 特價快報已更新！");
       setShowAlts({});
     } catch (err) { 
-      let errMsg = "搜尋失敗，請稍後再試。";
-      if (err.message.includes('400')) errMsg = "API 請求格式錯誤，請確認 Gemini 搜尋功能已開通。";
-      if (err.message.includes('401') || err.message.includes('403')) errMsg = "API 授權失敗，請確認已正確填寫 API Key。";
+      let errMsg = "搜尋失敗，可能是伺服器擁擠，請稍後重試。";
+      if (err.message.includes('400')) errMsg = "API 請求格式錯誤，請確認 Gemini Search 權限已開通。";
+      if (err.message.includes('401') || err.message.includes('403')) errMsg = "API 授權失敗，請確認已正確填寫 API Key 且具有搜尋權限。";
       showToast(errMsg); 
     } finally { 
       setIsSearchingDeals(false); 
@@ -731,7 +771,7 @@ const App = () => {
         </div>
       )}
 
-      {/* --- 🎯 防誤觸數量調整 Modal (完美支援小數輸入) --- */}
+      {/* --- 🎯 防誤觸數量調整 Modal --- */}
       {adjustStockModal && (
         <div className="fixed inset-0 z-[80] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in">
           <div className="bg-white rounded-3xl p-6 w-full max-w-xs shadow-2xl relative">
@@ -832,7 +872,7 @@ const App = () => {
                            <div className="flex w-full gap-2 items-center">
                               <span className="text-xs font-bold w-12 truncate">{log.item_name}</span>
                               <input type="number" step="0.1" autoFocus className="flex-1 text-xs p-1.5 border rounded outline-none w-full" value={editingLogQty} onChange={e=>setEditingLogQty(e.target.value)} />
-                              <button onClick={() => saveUsageLogEdit(log.id)} className="bg-emerald-500 text-white px-2 py-1.5 rounded text-[10px] font-bold">儲存</button>
+                              <button onClick={() => saveUsageLogEdit(log)} className="bg-emerald-500 text-white px-2 py-1.5 rounded text-[10px] font-bold">儲存</button>
                               <button onClick={() => setEditingLogId(null)} className="text-slate-400 px-1"><X size={14}/></button>
                            </div>
                         ) : (
@@ -845,7 +885,10 @@ const App = () => {
                               </div>
                               <div className="flex gap-1">
                                  <button onClick={() => {setEditingLogId(log.id); setEditingLogQty(log.consumed_qty);}} className="text-indigo-400 p-1.5 bg-white rounded shadow-sm"><Edit3 size={14}/></button>
-                                 <button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'usage_logs', log.id))} className="text-red-400 p-1.5 bg-white rounded shadow-sm"><Trash2 size={14}/></button>
+                                 <button 
+                                   onClick={() => triggerDelete('刪除紀錄？', '刪除後，系統將會為您還原庫存數量與更新日期。', () => handleDeleteUsageLog(log))} 
+                                   className="text-red-400 p-1.5 bg-white rounded shadow-sm"
+                                 ><Trash2 size={14}/></button>
                               </div>
                            </>
                         )}
@@ -862,70 +905,97 @@ const App = () => {
         {activeTab === 'inventory' && (
           <div className="space-y-4">
             
+            {/* 🌟 多重分類過濾器 */}
             <div className="flex gap-2">
-              <div className="flex-1 flex items-center bg-white rounded-xl border border-slate-200 px-3 shadow-sm">
-                <Filter size={14} className="text-indigo-400 shrink-0" />
-                <select value={filterCat} onChange={e=>setFilterCat(e.target.value)} className="w-full bg-transparent p-2.5 text-xs font-bold text-slate-700 outline-none">
-                  <option value="All">全部分類</option>
-                  {allCategoryNames.map(c => <option key={c} value={c}>{c}</option>)}
-                </select>
+              <div className="relative flex-1 z-40">
+                <button onClick={() => setIsFilterOpen(!isFilterOpen)} className="w-full flex items-center justify-between bg-white rounded-xl border border-slate-200 px-3 py-2.5 shadow-sm text-xs font-bold text-slate-700 outline-none">
+                  <div className="flex items-center gap-1.5 truncate">
+                     <Filter size={14} className="text-indigo-400 shrink-0" />
+                     <span className="truncate">{filterCats.length === 0 ? '全部分類' : `已選 ${filterCats.length} 類`}</span>
+                  </div>
+                  <ChevronDown size={14} className="text-slate-400 shrink-0" />
+                </button>
+                {isFilterOpen && (
+                  <>
+                    <div className="fixed inset-0 z-30" onClick={() => setIsFilterOpen(false)} />
+                    <div className="absolute top-full left-0 mt-1 w-full min-w-[140px] bg-white border border-slate-200 rounded-xl shadow-xl z-50 max-h-60 overflow-y-auto py-1.5 animate-in fade-in slide-in-from-top-1">
+                       <div 
+                         className="px-3 py-2.5 flex items-center gap-2.5 hover:bg-slate-50 cursor-pointer transition-colors"
+                         onClick={() => setFilterCats([])}
+                       >
+                         <div className={`w-4 h-4 rounded border flex items-center justify-center transition-colors ${filterCats.length === 0 ? 'bg-indigo-500 border-indigo-500' : 'border-slate-300'}`}>
+                           {filterCats.length === 0 && <CheckCircle2 size={12} className="text-white"/>}
+                         </div>
+                         <span className={`text-xs font-bold ${filterCats.length === 0 ? 'text-indigo-600' : 'text-slate-600'}`}>全部分類</span>
+                       </div>
+                       {allCategoryNames.map(c => (
+                         <div 
+                           key={c}
+                           className="px-3 py-2.5 flex items-center gap-2.5 hover:bg-slate-50 cursor-pointer transition-colors border-t border-slate-50"
+                           onClick={() => setFilterCats(prev => prev.includes(c) ? prev.filter(cat => cat !== c) : [...prev, c])}
+                         >
+                           <div className={`w-4 h-4 rounded border flex items-center justify-center transition-colors ${filterCats.includes(c) ? 'bg-indigo-500 border-indigo-500' : 'border-slate-300'}`}>
+                             {filterCats.includes(c) && <CheckCircle2 size={12} className="text-white"/>}
+                           </div>
+                           <span className={`text-xs font-bold ${filterCats.includes(c) ? 'text-indigo-600' : 'text-slate-600'}`}>{c}</span>
+                         </div>
+                       ))}
+                    </div>
+                  </>
+                )}
               </div>
-              <div className="flex-1 flex items-center bg-white rounded-xl border border-slate-200 px-3 shadow-sm">
-                <ArrowUpDown size={14} className="text-indigo-400 shrink-0" />
-                <select value={sortBy} onChange={e=>setSortBy(e.target.value)} className="w-full bg-transparent p-2.5 text-xs font-bold text-slate-700 outline-none">
+
+              <div className="flex-1 flex items-center bg-white rounded-xl border border-slate-200 px-3 py-2.5 shadow-sm">
+                <ArrowUpDown size={14} className="text-indigo-400 shrink-0 mr-1.5" />
+                <select value={sortBy} onChange={e=>setSortBy(e.target.value)} className="w-full bg-transparent text-xs font-bold text-slate-700 outline-none appearance-none">
                   <option value="name">名稱排序</option>
                   <option value="stockAsc">庫存:由少至多</option>
                   <option value="stockDesc">庫存:由多至少</option>
                   <option value="recent">最近更新</option>
                 </select>
+                <ChevronDown size={14} className="text-slate-400 shrink-0 pointer-events-none" />
               </div>
             </div>
 
             {displayedItems.length > 0 ? (
               <div className="grid grid-cols-2 gap-3">
                 {displayedItems.map(item => (
-                  <div key={item.id} className={`col-span-1 bg-white rounded-2xl p-3 shadow-sm border transition-all flex flex-col h-[135px] justify-between ${item.current_stock <= item.min_stock ? 'border-orange-200 ring-1 ring-orange-100' : 'border-slate-100'}`}>
+                  <div key={item.id} className={`col-span-1 bg-white rounded-2xl p-3 shadow-sm border transition-all flex flex-col h-full min-h-[145px] justify-between ${item.current_stock <= item.min_stock ? 'border-orange-200 ring-1 ring-orange-100' : 'border-slate-100'}`}>
                     
-                    <div className="flex justify-between items-start gap-1">
-                      <h3 className="font-bold text-slate-800 text-sm leading-tight line-clamp-2" title={item.display_name}>{item.display_name}</h3>
-                      <button onClick={() => openModal('edit', item)} className="text-slate-300 hover:text-indigo-500 p-1 -mt-1 -mr-1 shrink-0"><Edit3 size={14}/></button>
+                    <div>
+                       <div className="flex justify-between items-start gap-1">
+                         <h3 className="font-bold text-slate-800 text-sm leading-tight line-clamp-2" title={item.display_name}>{item.display_name}</h3>
+                         <button onClick={() => openModal('edit', item)} className="text-slate-300 hover:text-indigo-500 p-1 -mt-1 -mr-1 shrink-0"><Edit3 size={14}/></button>
+                       </div>
+                       
+                       <div className="flex flex-wrap gap-1 mt-1 mb-2">
+                         <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded font-bold truncate max-w-[60px]">{item.category}</span>
+                         {item.track_price && <span className="text-[9px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded font-bold flex items-center"><DollarSign size={8}/></span>}
+                         {item.current_stock <= item.min_stock && <span className="text-[9px] bg-orange-50 text-orange-600 px-1.5 py-0.5 rounded font-bold flex items-center"><AlertTriangle size={8}/> 低庫存</span>}
+                       </div>
                     </div>
-                    
-                    <div className="flex flex-wrap gap-1 mt-1 mb-auto">
-                      <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded font-bold truncate max-w-[60px]">{item.category}</span>
-                      {item.track_price && <span className="text-[9px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded font-bold flex items-center"><DollarSign size={8}/></span>}
-                      {item.current_stock <= item.min_stock && <span className="text-[9px] bg-orange-50 text-orange-600 px-1.5 py-0.5 rounded font-bold flex items-center"><AlertTriangle size={8}/> 低庫存</span>}
-                    </div>
 
-                    <div className="flex items-center justify-between pt-2 mt-1 border-t border-slate-50">
-                      <div className="flex flex-col">
-                         <span className="text-[9px] text-slate-400 flex items-center gap-0.5 whitespace-nowrap" title="最後更新"><Clock size={9}/> {formatDate(item.last_updated)}</span>
-                      </div>
-                      
-                      <div className="flex gap-1.5 items-center">
-                        <button 
-                          onClick={() => updateStock(item.id, -0.5)} 
-                          className="w-7 h-8 flex items-center justify-center text-slate-400 active:bg-slate-200 rounded-md bg-slate-50 border border-slate-100"
-                        >
-                          <Minus size={14}/>
-                        </button>
+                    <div className="mt-auto pt-2 border-t border-slate-50 flex flex-col gap-1.5">
+                       <span className="text-[9px] text-slate-400 flex items-center gap-0.5 w-full truncate" title="最後更新">
+                         <Clock size={9} className="shrink-0"/> 
+                         <span className="truncate">{formatDate(item.last_updated)}</span>
+                       </span>
+                       <div className="flex gap-1.5 items-center justify-between w-full">
+                         <button 
+                           onClick={() => { setAdjustStockModal(item); setAdjustAmount(String(item.current_stock)); }} 
+                           className="flex-1 bg-slate-50 hover:bg-indigo-50 border border-slate-100 rounded-lg px-2 py-1.5 flex flex-row items-baseline justify-center transition-colors shadow-sm active:scale-95 gap-1 overflow-hidden"
+                         >
+                           <span className={`font-black text-base truncate ${item.current_stock <= item.min_stock ? 'text-orange-500' : 'text-slate-800'}`}>{item.current_stock}</span>
+                           <span className="text-[10px] font-bold text-slate-500 truncate">{item.unit || '件'}</span>
+                         </button>
 
-                        {/* 🌟 點擊數字開啟微調面板 */}
-                        <button 
-                          onClick={() => { setAdjustStockModal(item); setAdjustAmount(String(item.current_stock)); }} 
-                          className="hover:bg-indigo-50 rounded-lg px-1 flex flex-col items-center justify-center transition-colors active:scale-95"
-                        >
-                          <span className={`font-black text-base leading-none ${item.current_stock <= item.min_stock ? 'text-orange-500' : 'text-slate-800'}`}>{item.current_stock}</span>
-                          <span className="text-[8px] font-bold text-slate-400 leading-none mt-0.5">{item.unit || '件'}</span>
-                        </button>
-
-                        <button 
-                          onClick={() => updateStock(item.id, 0.5)} 
-                          className="w-7 h-8 flex items-center justify-center text-slate-400 active:bg-slate-200 rounded-md bg-slate-50 border border-slate-100"
-                        >
-                          <Plus size={14}/>
-                        </button>
-                      </div>
+                         <button 
+                           onClick={() => toggleShoppingList(item.id, !item.in_shopping_list)} 
+                           className={`w-8 h-8 shrink-0 flex items-center justify-center rounded-lg transition-colors ${item.in_shopping_list ? 'bg-emerald-50 text-emerald-500' : 'bg-slate-50 text-slate-400 hover:bg-indigo-50 hover:text-indigo-500'}`}
+                         >
+                           {item.in_shopping_list ? <CheckCircle2 size={16}/> : <ShoppingCart size={16}/>}
+                         </button>
+                       </div>
                     </div>
                   </div>
                 ))}
@@ -949,25 +1019,56 @@ const App = () => {
                   <h3 className="font-black flex items-center gap-1.5 text-slate-800"><LineChart size={16} className="text-indigo-500"/> 智慧用量預測</h3>
                   <button onClick={() => setIsUsageLogsOpen(true)} className="text-[9px] text-indigo-500 font-bold bg-indigo-50 px-2 py-1 rounded-md flex items-center gap-1"><Database size={10}/> 紀錄</button>
                </div>
-               <p className="text-[10px] text-slate-500 mb-3 leading-relaxed">系統會根據您手動扣除庫存的「實際消耗紀錄」，預測剩餘物品何時會用完。</p>
+               <p className="text-[10px] text-slate-500 mb-3 leading-relaxed">系統會根據您手動扣除庫存的「實際消耗紀錄」，推算未來耗盡日期。</p>
                
-               {/* 💡 分析預測區的過濾與排序 */}
+               {/* 🌟 分析頁面多選過濾器 */}
                {usageInsights.length > 0 && (
                  <div className="flex gap-2 mb-4">
-                    <div className="flex-1 flex items-center bg-slate-50 rounded-lg border border-slate-100 px-2">
-                      <Filter size={12} className="text-slate-400 shrink-0" />
-                      <select value={analysisFilterCat} onChange={e=>setAnalysisFilterCat(e.target.value)} className="w-full bg-transparent p-1.5 text-[10px] font-bold text-slate-600 outline-none">
-                        <option value="All">全部分類</option>
-                        {allCategoryNames.map(c => <option key={c} value={c}>{c}</option>)}
-                      </select>
+                    <div className="relative flex-1 z-30">
+                      <button onClick={() => setIsAnalysisFilterOpen(!isAnalysisFilterOpen)} className="w-full flex items-center justify-between bg-slate-50 rounded-lg border border-slate-100 px-2 py-1.5 text-[10px] font-bold text-slate-600 outline-none">
+                        <div className="flex items-center gap-1 truncate">
+                           <Filter size={12} className="text-slate-400 shrink-0" />
+                           <span className="truncate">{analysisFilterCats.length === 0 ? '全部分類' : `已選 ${analysisFilterCats.length} 類`}</span>
+                        </div>
+                        <ChevronDown size={12} className="text-slate-400 shrink-0" />
+                      </button>
+                      {isAnalysisFilterOpen && (
+                        <>
+                          <div className="fixed inset-0 z-20" onClick={() => setIsAnalysisFilterOpen(false)} />
+                          <div className="absolute top-full left-0 mt-1 w-full min-w-[120px] bg-white border border-slate-200 rounded-xl shadow-xl z-40 max-h-60 overflow-y-auto py-1 animate-in fade-in slide-in-from-top-1">
+                             <div 
+                               className="px-2 py-2 flex items-center gap-2 hover:bg-slate-50 cursor-pointer transition-colors"
+                               onClick={() => setAnalysisFilterCats([])}
+                             >
+                               <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center transition-colors ${analysisFilterCats.length === 0 ? 'bg-indigo-500 border-indigo-500' : 'border-slate-300'}`}>
+                                 {analysisFilterCats.length === 0 && <CheckCircle2 size={10} className="text-white"/>}
+                               </div>
+                               <span className={`text-[10px] font-bold ${analysisFilterCats.length === 0 ? 'text-indigo-600' : 'text-slate-600'}`}>全部分類</span>
+                             </div>
+                             {allCategoryNames.map(c => (
+                               <div 
+                                 key={c}
+                                 className="px-2 py-2 flex items-center gap-2 hover:bg-slate-50 cursor-pointer transition-colors border-t border-slate-50"
+                                 onClick={() => setAnalysisFilterCats(prev => prev.includes(c) ? prev.filter(cat => cat !== c) : [...prev, c])}
+                               >
+                                 <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center transition-colors ${analysisFilterCats.includes(c) ? 'bg-indigo-500 border-indigo-500' : 'border-slate-300'}`}>
+                                   {analysisFilterCats.includes(c) && <CheckCircle2 size={10} className="text-white"/>}
+                                 </div>
+                                 <span className={`text-[10px] font-bold ${analysisFilterCats.includes(c) ? 'text-indigo-600' : 'text-slate-600'}`}>{c}</span>
+                               </div>
+                             ))}
+                          </div>
+                        </>
+                      )}
                     </div>
-                    <div className="flex-1 flex items-center bg-slate-50 rounded-lg border border-slate-100 px-2">
-                      <ArrowUpDown size={12} className="text-slate-400 shrink-0" />
-                      <select value={analysisSortBy} onChange={e=>setAnalysisSortBy(e.target.value)} className="w-full bg-transparent p-1.5 text-[10px] font-bold text-slate-600 outline-none">
+                    <div className="flex-1 flex items-center bg-slate-50 rounded-lg border border-slate-100 px-2 py-1.5">
+                      <ArrowUpDown size={12} className="text-slate-400 shrink-0 mr-1" />
+                      <select value={analysisSortBy} onChange={e=>setAnalysisSortBy(e.target.value)} className="w-full bg-transparent text-[10px] font-bold text-slate-600 outline-none appearance-none">
                         <option value="daysAsc">最快用完</option>
                         <option value="daysDesc">最慢用完</option>
                         <option value="name">名稱排序</option>
                       </select>
+                      <ChevronDown size={12} className="text-slate-400 shrink-0 pointer-events-none" />
                     </div>
                  </div>
                )}
@@ -975,22 +1076,28 @@ const App = () => {
                {displayedInsights.length > 0 ? (
                  <div className="space-y-3">
                    {displayedInsights.map(insight => (
-                      <div key={insight.id} className="bg-slate-50 rounded-2xl p-3 border border-slate-100 flex items-center justify-between">
-                         <div>
-                            <div className="flex items-center gap-2 mb-1">
+                      <div key={insight.id} className="bg-slate-50 rounded-2xl p-3 border border-slate-100 flex flex-col justify-between">
+                         <div className="flex items-center justify-between mb-2">
+                            <div className="flex items-center gap-2">
                                <span className="font-bold text-slate-800 text-sm">{insight.display_name}</span>
                                {insight.status === 'critical' && <span className="bg-red-50 text-red-500 text-[8px] font-black px-1.5 py-0.5 rounded">即將用罄</span>}
                             </div>
-                            <p className="text-[10px] text-slate-500">已紀錄：{insight.debug_days} 天用 {insight.debug_consumed} {insight.unit} (約 {insight.monthlyUsage}/月)</p>
-                         </div>
-                         <div className="text-right">
-                            <p className="text-[10px] text-slate-400 mb-0.5">預計可用</p>
-                            <p className={`font-black text-lg leading-none ${insight.status === 'critical' ? 'text-red-500' : insight.status === 'warning' ? 'text-orange-500' : 'text-emerald-500'}`}>
-                               {insight.daysLeft > 900 ? '充足' : insight.daysLeft} <span className="text-[10px] font-bold">{insight.daysLeft > 900 ? '' : '天'}</span>
-                            </p>
                             {insight.status !== 'good' && !insight.in_shopping_list && (
-                               <button onClick={() => toggleShoppingList(insight.id, true)} className="mt-1.5 text-[9px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-100 shadow-sm active:scale-95">加採購單</button>
+                               <button onClick={() => toggleShoppingList(insight.id, true)} className="text-[9px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-100 shadow-sm active:scale-95">加採購單</button>
                             )}
+                         </div>
+                         
+                         <div className="flex items-end justify-between border-t border-slate-200 pt-2">
+                            <div className="flex flex-col gap-0.5">
+                              <p className="text-[9px] text-slate-400 font-medium">已追蹤：{insight.debug_days}天 耗 {insight.debug_consumed} {insight.unit}</p>
+                              <p className="text-[10px] text-slate-500 font-bold">預估月耗：{insight.monthlyUsage} {insight.unit || '件'}</p>
+                            </div>
+                            <div className="text-right">
+                               <p className="text-[9px] text-slate-400 mb-0.5">預計可用至</p>
+                               <p className={`font-black text-sm leading-none ${insight.status === 'critical' ? 'text-red-500' : insight.status === 'warning' ? 'text-orange-500' : 'text-emerald-500'}`}>
+                                  {insight.daysLeft > 900 ? '存量充足' : insight.depletionDateString} <span className="text-[9px] font-bold">({insight.daysLeft > 900 ? '900+ 天' : `剩 ${insight.daysLeft} 天`})</span>
+                               </p>
+                            </div>
                          </div>
                       </div>
                    ))}
@@ -1070,7 +1177,6 @@ const App = () => {
                               )}
                            </div>
 
-                           {/* 展開其他報價 */}
                            {showAlts[deal.id] && deal.alternatives?.length > 0 && (
                              <div className="mt-1 pt-2 border-t border-dashed border-white/10 space-y-1.5 animate-in slide-in-from-top-2">
                                {deal.alternatives.map((alt, i) => (
@@ -1161,7 +1267,7 @@ const App = () => {
           </div>
         )}
 
-        {/* --- 共用新增/編輯 Modal --- */}
+        {/* --- 共用新增/編輯 Modal z-50 --- */}
         {modalMode && (
           <div className="fixed inset-0 z-[90] bg-black/60 backdrop-blur-sm flex items-end sm:items-center p-0 sm:p-4 animate-in fade-in">
              <div className="bg-white rounded-t-3xl sm:rounded-3xl p-5 w-full max-w-sm relative max-h-[90vh] overflow-y-auto animate-in slide-in-from-bottom-full duration-300 mx-auto">
@@ -1222,6 +1328,7 @@ const App = () => {
 
                    <button onClick={saveItemForm} className="w-full bg-indigo-600 text-white py-3.5 rounded-xl font-bold text-sm shadow-md active:scale-95">確認儲存</button>
                    
+                   {/* 刪除按鈕 */}
                    {modalMode === 'edit' && (
                      <button 
                        onClick={() => triggerDelete('刪除物品', `確定要永久刪除「${itemForm.name}」嗎？`, () => {
@@ -1238,7 +1345,7 @@ const App = () => {
           </div>
         )}
 
-        {/* --- 類別管理 Modal (管理所有類別) --- */}
+        {/* --- 類別管理 Modal (管理所有類別) z-[100] --- */}
         {isManagingCats && (
            <div className="fixed inset-0 z-[100] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in">
               <div className="bg-white rounded-3xl p-5 w-full max-w-xs shadow-2xl relative">
@@ -1275,7 +1382,7 @@ const App = () => {
            </div>
         )}
 
-        {/* 相機介面 */}
+        {/* 相機介面 z-50 */}
         {isScanning && (
           <div className="fixed inset-0 z-50 bg-black flex flex-col p-6 animate-in fade-in">
              <div className="relative aspect-[3/4] w-full max-w-sm mx-auto rounded-3xl overflow-hidden border-2 border-indigo-400 mt-4">
