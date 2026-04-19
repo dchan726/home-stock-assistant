@@ -270,6 +270,7 @@ const App = () => {
     return filtered;
   }, [items, filterCats, sortBy]);
 
+  // 🛡️ 耗盡預測演算法 (確保安全解碼時間戳記)
   const rawUsageInsights = useMemo(() => {
     if (!items.length || !usageLogs.length) return [];
     const now = new Date();
@@ -437,6 +438,7 @@ const App = () => {
     });
   };
 
+  // 🛡️ 完美的 Transaction 數量調整
   const handleConfirmAdjustment = async () => {
     if (!user || !adjustStockModal) return;
     const item = adjustStockModal;
@@ -454,10 +456,20 @@ const App = () => {
         const sfDoc = await transaction.get(itemRef);
         if (!sfDoc.exists()) throw new Error("物品不存在！");
         
-        const currentStock = Number(sfDoc.data().current_stock) || 0;
-        const previousLastUpdated = sfDoc.data().last_updated;
-        const delta = Number((newStock - currentStock).toFixed(2));
+        const data = sfDoc.data();
+        const currentStock = Number(data.current_stock) || 0;
         
+        // 💡 絕對安全的 Timestamp 解碼護盾
+        let prevDate = null;
+        if (data.last_updated) {
+           if (typeof data.last_updated.toDate === 'function') {
+              prevDate = data.last_updated.toDate();
+           } else if (data.last_updated.seconds) {
+              prevDate = new Date(data.last_updated.seconds * 1000);
+           }
+        }
+
+        const delta = Number((newStock - currentStock).toFixed(2));
         if (delta === 0) return;
 
         transaction.update(itemRef, {
@@ -470,12 +482,12 @@ const App = () => {
           const usageLogRef = doc(collection(db, 'artifacts', appId, 'users', user.uid, 'usage_logs'));
           transaction.set(usageLogRef, {
             item_id: item.id,
-            item_name: item.display_name,
+            item_name: item.display_name || '未命名',
             consumed_qty: consumed,
             unit: item.unit || '件',
             logged_at: serverTimestamp(),
             previous_stock: currentStock,
-            previous_last_updated: previousLastUpdated || null
+            previous_last_updated: prevDate // 這裡保證送出的是 JS 原生 Date 物件或 null
           });
         }
       });
@@ -487,7 +499,8 @@ const App = () => {
         showToast(`庫存已增加 ${diff} ${item.unit || '件'}`);
       }
     } catch (e) {
-      showToast('更新失敗：' + e.message);
+      console.error("Adjustment error: ", e);
+      showToast('更新失敗，請重試');
     }
 
     setAdjustStockModal(null);
@@ -521,6 +534,7 @@ const App = () => {
       });
       showToast('消耗紀錄已更新，並同步修正庫存');
     } catch (e) {
+      console.error(e);
       showToast('更新失敗');
     }
     setEditingLogId(null);
@@ -538,14 +552,21 @@ const App = () => {
         if (itemDoc.exists()) {
           const restoredStock = Number((Number(itemDoc.data().current_stock) + Number(log.consumed_qty)).toFixed(2));
           const updatePayload = { current_stock: restoredStock };
-          if (log.previous_last_updated !== undefined) {
-            updatePayload.last_updated = log.previous_last_updated;
+          
+          // 💡 絕對安全的 Timestamp 還原護盾
+          if (log.previous_last_updated) {
+            if (typeof log.previous_last_updated.toDate === 'function') {
+               updatePayload.last_updated = log.previous_last_updated.toDate();
+            } else if (log.previous_last_updated.seconds) {
+               updatePayload.last_updated = new Date(log.previous_last_updated.seconds * 1000);
+            }
           }
           transaction.update(itemRef, updatePayload);
         }
       });
       showToast('已刪除紀錄，庫存與更新日期已還原');
     } catch (e) {
+      console.error(e);
       showToast('刪除還原失敗');
     }
   };
@@ -1082,11 +1103,12 @@ const App = () => {
 
       <main className="max-w-md mx-auto p-3 space-y-4">
         
-        {/* --- 儲藏室分頁 --- */}
+        {/* =====================================================================
+            分頁 1：儲藏室
+            ===================================================================== */}
         {activeTab === 'inventory' && (
           <div className="space-y-4">
             
-            {/* 🌟 完美的自訂多重分類過濾器 (Inventory) */}
             <div className="flex gap-2">
               <div className="relative flex-1 z-40">
                 <button onClick={() => setIsFilterOpen(!isFilterOpen)} className="w-full flex items-center justify-between bg-white rounded-xl border border-slate-200 px-3 py-2.5 shadow-sm text-xs font-bold text-slate-700 outline-none">
@@ -1428,7 +1450,7 @@ const App = () => {
           </div>
         )}
 
-        {/* --- 🌟 共用新增/編輯 Modal (加入重設按鈕) --- */}
+        {/* --- 共用新增/編輯 Modal z-[90] --- */}
         {modalMode && (
           <div className="fixed inset-0 z-[90] bg-black/60 backdrop-blur-sm flex items-end sm:items-center p-0 sm:p-4 animate-in fade-in">
              <div className="bg-white rounded-t-3xl sm:rounded-3xl p-5 w-full max-w-sm relative max-h-[90vh] overflow-y-auto animate-in slide-in-from-bottom-full duration-300 mx-auto">
@@ -1478,6 +1500,7 @@ const App = () => {
                           <input type="number" step="0.1" value={itemForm.min} onChange={e => setItemForm({...itemForm, min: e.target.value})} className="font-bold text-lg text-orange-600 w-12 text-center bg-transparent outline-none" />
                           <button onClick={() => setItemForm({...itemForm, min: String(Number((Number(itemForm.min)+0.5).toFixed(2)))})} className="p-2 text-orange-400"><Plus size={16}/></button>
                         </div>
+                        {/* 💡 AI 警戒線建議 UI */}
                         {modalMode === 'edit' && rawUsageInsights.find(i => i.id === itemForm.id)?.suggestedMinStock > 0 && (
                           <div 
                             className="mt-1.5 text-[9px] text-center text-indigo-600 bg-indigo-50 border border-indigo-100 rounded py-1 px-1 cursor-pointer active:scale-95 transition-transform"
@@ -1592,6 +1615,7 @@ const App = () => {
         )}
       </main>
 
+      {/* 🌟 全新 4 分頁導覽列 */}
       <nav className="fixed bottom-0 left-0 right-0 bg-white/95 backdrop-blur-xl border-t flex justify-between items-center z-40 pb-safe shadow-[0_-4px_20px_rgba(0,0,0,0.05)] px-2">
         <button onClick={() => setActiveTab('inventory')} className={`flex flex-col items-center justify-center w-full py-2.5 transition-all ${activeTab === 'inventory' ? 'text-indigo-600' : 'text-slate-400'}`}>
           <Package size={22} strokeWidth={activeTab === 'inventory' ? 2.5 : 2}/>
