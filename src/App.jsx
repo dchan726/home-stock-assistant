@@ -1,19 +1,21 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged 
 } from 'firebase/auth';
 import { 
   getFirestore, collection, doc, onSnapshot, getDoc,
-  updateDoc, deleteDoc, addDoc, setDoc, serverTimestamp 
+  updateDoc, deleteDoc, addDoc, setDoc, serverTimestamp,
+  runTransaction, writeBatch
 } from 'firebase/firestore';
 import { 
   Camera, Image as ImageIcon, PlusCircle, Package, ShoppingCart, 
   TrendingUp, Plus, Minus, Trash2, Loader2, CheckCircle2, 
-  AlertTriangle, Edit3, Save, BellRing, History, X, 
-  ListPlus, Tag, Zap, Search, DollarSign, Store, Clock, 
+  AlertTriangle, Edit3, Save, History, X, 
+  Tag, Zap, Search, DollarSign, Store, Clock, 
   ChevronDown, ChevronUp, Settings, Sparkles, Filter, 
-  ArrowUpDown, User, Lock, LogOut, LineChart, Database
+  ArrowUpDown, User, Lock, LogOut, LineChart, Database,
+  RotateCcw
 } from 'lucide-react';
 
 const firebaseConfig = {
@@ -36,6 +38,22 @@ const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
 const commonUnits = ['件', '包', '支', '排', '盒', '罐', '樽', '袋'];
 const commonSuppliers = ['不限', 'HKTVmall', '百佳', '惠康', '萬寧', '屈臣氏', 'DONKI'];
 
+// 🛡️ 安全的時間解析器
+const getSafeDate = (ts) => {
+  if (!ts) return new Date();
+  if (ts.seconds) return new Date(ts.seconds * 1000);
+  if (ts.toMillis) return new Date(ts.toMillis());
+  return new Date();
+};
+
+// 統一時間格式化
+const formatDate = (ts) => {
+  if (!ts) return "---";
+  const d = getSafeDate(ts);
+  if (isNaN(d.getTime())) return "---";
+  return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
+};
+
 const fetchWithRetry = async (url, options, retries = 5, delay = 1000) => {
   try {
     const response = await fetch(url, options);
@@ -54,13 +72,55 @@ const fetchWithRetry = async (url, options, retries = 5, delay = 1000) => {
   }
 };
 
+// --------------------------------------------------------------------------------
+// 🧩 子元件：庫存卡片
+// --------------------------------------------------------------------------------
+const ItemCard = React.memo(({ item, onEdit, onAdjust, onToggleShopping }) => {
+  return (
+    <div className={`col-span-1 bg-white rounded-2xl p-3 shadow-sm border transition-all flex flex-col h-full min-h-[145px] justify-between ${item.current_stock <= item.min_stock ? 'border-orange-200 ring-1 ring-orange-100' : 'border-slate-100'}`}>
+      <div>
+         <div className="flex justify-between items-start gap-1">
+           <h3 className="font-bold text-slate-800 text-sm leading-tight line-clamp-2" title={item.display_name}>{item.display_name}</h3>
+           <button onClick={() => onEdit(item)} className="text-slate-300 hover:text-indigo-500 p-1 -mt-1 -mr-1 shrink-0"><Edit3 size={14}/></button>
+         </div>
+         <div className="flex flex-wrap gap-1 mt-1 mb-2">
+           <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded font-bold truncate max-w-[60px]">{item.category}</span>
+           {item.track_price && <span className="text-[9px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded font-bold flex items-center"><DollarSign size={8}/></span>}
+           {item.current_stock <= item.min_stock && <span className="text-[9px] bg-orange-50 text-orange-600 px-1.5 py-0.5 rounded font-bold flex items-center"><AlertTriangle size={8}/> 低庫存</span>}
+         </div>
+      </div>
+      <div className="mt-auto pt-2 border-t border-slate-50 flex flex-col gap-1.5">
+         <span className="text-[9px] text-slate-400 flex items-center gap-0.5 w-full truncate" title="最後更新">
+           <Clock size={9} className="shrink-0"/> 
+           <span className="truncate">{formatDate(item.last_updated)}</span>
+         </span>
+         <div className="flex gap-1.5 items-center justify-between w-full">
+           <button 
+             onClick={() => onAdjust(item)} 
+             className="flex-1 bg-slate-50 hover:bg-indigo-50 border border-slate-100 rounded-lg px-2 py-1.5 flex flex-row items-baseline justify-center transition-colors shadow-sm active:scale-95 gap-1 overflow-hidden"
+           >
+             <span className={`font-black text-base truncate ${item.current_stock <= item.min_stock ? 'text-orange-500' : 'text-slate-800'}`}>{item.current_stock}</span>
+             <span className="text-[10px] font-bold text-slate-500 truncate">{item.unit || '件'}</span>
+           </button>
+           <button 
+             onClick={() => onToggleShopping(item.id, !item.in_shopping_list, item)} 
+             className={`w-8 h-8 shrink-0 flex items-center justify-center rounded-lg transition-colors ${item.in_shopping_list ? 'bg-emerald-50 text-emerald-500' : 'bg-slate-50 text-slate-400 hover:bg-indigo-50 hover:text-indigo-500'}`}
+           >
+             {item.in_shopping_list ? <CheckCircle2 size={16}/> : <ShoppingCart size={16}/>}
+           </button>
+         </div>
+      </div>
+    </div>
+  );
+});
+
+// --------------------------------------------------------------------------------
+// 🧩 主要應用程式元件
+// --------------------------------------------------------------------------------
 const App = () => {
   const [user, setUser] = useState(null);
   const [authChecking, setAuthChecking] = useState(true);
   const [userSettings, setUserSettings] = useState({ defaultMinStock: 2 });
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [editSettingsMinStock, setEditSettingsMinStock] = useState(2);
-
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [authError, setAuthError] = useState('');
@@ -74,17 +134,25 @@ const App = () => {
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('inventory');
   
-  // 🌟 改為支援多選分類的過濾狀態
-  const [filterCats, setFilterCats] = useState([]); 
+  const [filterCats, setFilterCats] = useState(() => {
+    try { const saved = localStorage.getItem('inventoryFilterCats'); return saved ? JSON.parse(saved) : []; } catch(e) { return []; }
+  }); 
   const [isFilterOpen, setIsFilterOpen] = useState(false);
   const [sortBy, setSortBy] = useState('name'); 
   
-  const [analysisFilterCats, setAnalysisFilterCats] = useState([]);
+  const [analysisFilterCats, setAnalysisFilterCats] = useState(() => {
+    try { const saved = localStorage.getItem('analysisFilterCats'); return saved ? JSON.parse(saved) : []; } catch(e) { return []; }
+  });
   const [isAnalysisFilterOpen, setIsAnalysisFilterOpen] = useState(false);
   const [analysisSortBy, setAnalysisSortBy] = useState('daysAsc');
 
+  useEffect(() => { localStorage.setItem('inventoryFilterCats', JSON.stringify(filterCats)); }, [filterCats]);
+  useEffect(() => { localStorage.setItem('analysisFilterCats', JSON.stringify(analysisFilterCats)); }, [analysisFilterCats]);
+
   const [toast, setToast] = useState(null);
   const [confirmDialog, setConfirmDialog] = useState(null);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [editSettingsMinStock, setEditSettingsMinStock] = useState(2);
 
   const [modalMode, setModalMode] = useState(null); 
   const [itemForm, setItemForm] = useState({ id: null, name: '', category: '未分類', unit: '件', stock: '1', min: '2', track_price: false });
@@ -115,7 +183,10 @@ const App = () => {
   const canvasRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  const showToast = (message) => { setToast(message); setTimeout(() => setToast(null), 3000); };
+  const showToast = useCallback((message) => { 
+    setToast(message); 
+    setTimeout(() => setToast(null), 3000); 
+  }, []);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
@@ -178,20 +249,97 @@ const App = () => {
     return () => { unsubscribeItems(); unsubscribeHistory(); unsubscribeUsage(); unsubscribeCat(); unsubscribeDeals(); unsubscribeSettings(); };
   }, [user]);
 
-  const uniqueItemCats = items.map(i => i.category).filter(Boolean);
-  const allCategoryNames = Array.from(new Set([...categories.map(c => c.name), ...uniqueItemCats]));
+  const allCategoryNames = useMemo(() => {
+    const uniqueItemCats = items.map(i => i.category).filter(Boolean);
+    const combined = Array.from(new Set([...categories.map(c => c.name), ...uniqueItemCats]));
+    return combined.sort((a, b) => a.localeCompare(b, 'zh-TW'));
+  }, [items, categories]);
 
-  useEffect(() => {
-    const newAmounts = { ...purchaseAmounts };
-    let changed = false;
-    items.filter(i => i.in_shopping_list).forEach(item => {
-      if (newAmounts[item.id] === undefined) {
-        newAmounts[item.id] = Math.max(1, Math.ceil(Number(item.min_stock || 1) * 2 - Number(item.current_stock || 0)));
-        changed = true;
-      }
+  const displayedItems = useMemo(() => {
+    let filtered = [...items];
+    if (filterCats.length > 0) {
+      filtered = filtered.filter(i => filterCats.includes(i.category));
+    }
+    filtered.sort((a, b) => {
+      if (sortBy === 'name') return (a.display_name || '').localeCompare(b.display_name || '', 'zh-TW');
+      if (sortBy === 'stockAsc') return (Number(a.current_stock) || 0) - (Number(b.current_stock) || 0);
+      if (sortBy === 'stockDesc') return (Number(b.current_stock) || 0) - (Number(a.current_stock) || 0);
+      if (sortBy === 'recent') return (b.last_updated?.seconds || 0) - (a.last_updated?.seconds || 0);
+      return 0;
     });
-    if (changed) setPurchaseAmounts(newAmounts);
-  }, [items]);
+    return filtered;
+  }, [items, filterCats, sortBy]);
+
+  const rawUsageInsights = useMemo(() => {
+    if (!items.length || !usageLogs.length) return [];
+    const now = new Date();
+    
+    const logsByItem = usageLogs.reduce((acc, log) => {
+      if (!acc[log.item_id]) acc[log.item_id] = [];
+      acc[log.item_id].push(log);
+      return acc;
+    }, {});
+
+    return items.reduce((acc, item) => {
+      const logs = logsByItem[item.id];
+      if (logs && logs.length > 0) {
+        const newestLog = logs[0]; 
+        const oldestLog = logs[logs.length - 1]; 
+
+        const startDate = oldestLog.previous_last_updated 
+          ? getSafeDate(oldestLog.previous_last_updated) 
+          : getSafeDate(oldestLog.logged_at);
+        const endDate = getSafeDate(newestLog.logged_at);
+          
+        let daysForRate = (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24);
+        if (daysForRate < 1) daysForRate = 1; 
+        
+        const totalConsumed = logs.reduce((sum, log) => sum + (Number(log.consumed_qty) || 0), 0);
+        
+        if (totalConsumed > 0) {
+          const dailyUsage = totalConsumed / daysForRate;
+          const monthlyUsage = Number((dailyUsage * 30).toFixed(1)); 
+          const daysLeft = dailyUsage > 0 ? Math.floor(Number(item.current_stock) / dailyUsage) : 999;
+          
+          const suggestedMinStock = Math.max(0.5, Math.ceil(dailyUsage * 7 * 2) / 2);
+          
+          const depletionDate = new Date(now.getTime() + daysLeft * 24 * 60 * 60 * 1000);
+          const depletionDateString = isNaN(depletionDate.getTime()) 
+            ? '未知' 
+            : `${depletionDate.getFullYear()}年${depletionDate.getMonth() + 1}月${depletionDate.getDate()}日`;
+          
+          let daysLeftNow = Math.ceil((depletionDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+          if (daysLeftNow < 0) daysLeftNow = 0;
+          
+          acc.push({
+            ...item,
+            monthlyUsage: isNaN(monthlyUsage) ? 0 : monthlyUsage,
+            suggestedMinStock, 
+            daysLeft: isNaN(daysLeftNow) ? 999 : daysLeftNow,
+            depletionDateString,
+            status: daysLeftNow <= 7 ? 'critical' : daysLeftNow <= 14 ? 'warning' : 'good',
+            debug_days: Number(daysForRate.toFixed(1)),
+            debug_consumed: Number(totalConsumed.toFixed(2))
+          });
+        }
+      }
+      return acc;
+    }, []);
+  }, [items, usageLogs]); 
+
+  const displayedInsights = useMemo(() => {
+    let filtered = [...rawUsageInsights];
+    if (analysisFilterCats.length > 0) {
+      filtered = filtered.filter(i => analysisFilterCats.includes(i.category));
+    }
+    filtered.sort((a, b) => {
+      if (analysisSortBy === 'daysAsc') return a.daysLeft - b.daysLeft;
+      if (analysisSortBy === 'daysDesc') return b.daysLeft - a.daysLeft;
+      if (analysisSortBy === 'name') return (a.display_name || '').localeCompare(b.display_name || '', 'zh-TW');
+      return 0;
+    });
+    return filtered; 
+  }, [rawUsageInsights, analysisFilterCats, analysisSortBy]);
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -233,10 +381,12 @@ const App = () => {
       onConfirm: async () => {
         setLoading(true);
         try {
-          for (const item of items) await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', item.id));
-          for (const log of usageLogs) await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'usage_logs', log.id));
-          for (const hist of historyLogs) await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'purchase_history', hist.id));
-          for (const cat of categories) await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'categories', cat.id));
+          const batch = writeBatch(db);
+          items.forEach(i => batch.delete(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', i.id)));
+          usageLogs.forEach(l => batch.delete(doc(db, 'artifacts', appId, 'users', user.uid, 'usage_logs', l.id)));
+          historyLogs.forEach(h => batch.delete(doc(db, 'artifacts', appId, 'users', user.uid, 'purchase_history', h.id)));
+          categories.forEach(c => batch.delete(doc(db, 'artifacts', appId, 'users', user.uid, 'categories', c.id)));
+          await batch.commit();
           showToast('系統已完全重設');
         } catch(e) {
           showToast('重設過程中發生錯誤');
@@ -248,109 +398,43 @@ const App = () => {
     });
   };
 
-  // 🌟 升級版多分類過濾
-  const getDisplayedItems = () => {
-    let filtered = [...items];
-    if (filterCats.length > 0) {
-      filtered = filtered.filter(i => filterCats.includes(i.category));
-    }
-    filtered.sort((a, b) => {
-      if (sortBy === 'name') return (a.display_name || '').localeCompare(b.display_name || '', 'zh-TW');
-      if (sortBy === 'stockAsc') return (Number(a.current_stock) || 0) - (Number(b.current_stock) || 0);
-      if (sortBy === 'stockDesc') return (Number(b.current_stock) || 0) - (Number(a.current_stock) || 0);
-      if (sortBy === 'recent') return (b.last_updated?.seconds || 0) - (a.last_updated?.seconds || 0);
-      return 0;
-    });
-    return filtered;
-  };
-  const displayedItems = getDisplayedItems();
+  // 🌟 單一物品的重設紀錄與數量歸零
+  const handleResetItemData = (itemId) => {
+    const item = items.find(i => i.id === itemId);
+    if (!item) return;
 
-  const getRawUsageInsights = () => {
-    const insights = [];
-    const now = new Date();
+    setConfirmDialog({
+      title: '重設物品資料',
+      message: `確定要重設「${item.display_name}」嗎？\n這將會把庫存強制歸零，並且永久刪除該物品的所有消耗與購買紀錄！`,
+      confirmText: '確定重設',
+      cancelText: '取消',
+      onConfirm: async () => {
+        try {
+          const batch = writeBatch(db);
+          const logsToDelete = usageLogs.filter(log => log.item_id === itemId);
+          const historyToDelete = historyLogs.filter(hist => hist.item_id === itemId);
 
-    items.forEach(item => {
-      const logs = usageLogs
-        .filter(log => log.item_id === item.id)
-        .sort((a, b) => (a.logged_at?.seconds || 0) - (b.logged_at?.seconds || 0));
-
-      if (logs.length > 0) {
-        const firstLogDate = logs[0].previous_last_updated 
-          ? new Date(logs[0].previous_last_updated.seconds * 1000) 
-          : new Date(logs[0].logged_at?.seconds * 1000);
-          
-        let daysSinceFirstLog = (now - firstLogDate) / (1000 * 60 * 60 * 24);
-        if (daysSinceFirstLog < 1) daysSinceFirstLog = 1; 
-        
-        const totalConsumed = logs.reduce((sum, log) => sum + (Number(log.consumed_qty) || 0), 0);
-        
-        if (totalConsumed > 0) {
-          const dailyUsage = totalConsumed / daysSinceFirstLog;
-          const monthlyUsage = Number((dailyUsage * 30).toFixed(1)); 
-          const daysLeft = dailyUsage > 0 ? Math.floor(Number(item.current_stock) / dailyUsage) : 999;
-          
-          const depletionDate = new Date(now.getTime() + daysLeft * 24 * 60 * 60 * 1000);
-          const depletionDateString = `${depletionDate.getFullYear()}年${depletionDate.getMonth() + 1}月${depletionDate.getDate()}日`;
-          
-          insights.push({
-            ...item,
-            monthlyUsage,
-            daysLeft,
-            depletionDateString,
-            status: daysLeft <= 7 ? 'critical' : daysLeft <= 14 ? 'warning' : 'good',
-            debug_days: Number(daysSinceFirstLog.toFixed(1)),
-            debug_consumed: Number(totalConsumed.toFixed(2))
+          logsToDelete.forEach(log => {
+            batch.delete(doc(db, 'artifacts', appId, 'users', user.uid, 'usage_logs', log.id));
           });
+          historyToDelete.forEach(hist => {
+            batch.delete(doc(db, 'artifacts', appId, 'users', user.uid, 'purchase_history', hist.id));
+          });
+
+          batch.update(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', itemId), {
+            current_stock: 0,
+            last_updated: serverTimestamp()
+          });
+
+          await batch.commit();
+          showToast('物品已重設 (庫存歸零並清除所有紀錄)');
+          setModalMode(null);
+        } catch (error) {
+          showToast('重設失敗');
         }
+        setConfirmDialog(null);
       }
     });
-    return insights;
-  };
-  
-  const usageInsights = getRawUsageInsights(); 
-
-  const getDisplayedInsights = () => {
-    let filteredInsights = [...usageInsights];
-    if (analysisFilterCats.length > 0) {
-      filteredInsights = filteredInsights.filter(i => analysisFilterCats.includes(i.category));
-    }
-    filteredInsights.sort((a, b) => {
-      if (analysisSortBy === 'daysAsc') return a.daysLeft - b.daysLeft;
-      if (analysisSortBy === 'daysDesc') return b.daysLeft - a.daysLeft;
-      if (analysisSortBy === 'name') return (a.display_name || '').localeCompare(b.display_name || '', 'zh-TW');
-      return 0;
-    });
-    return filteredInsights; 
-  };
-  
-  const displayedInsights = getDisplayedInsights(); 
-
-  const updateStock = async (id, delta) => {
-    const item = items.find(i => i.id === id);
-    if (!item) return;
-    
-    const currentStock = Number(item.current_stock) || 0;
-    const previousLastUpdated = item.last_updated; 
-    const newStock = Math.max(0, Number((currentStock + delta).toFixed(2)));
-    const actualDelta = Number((newStock - currentStock).toFixed(2));
-
-    await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', id), {
-      current_stock: newStock, last_updated: serverTimestamp() // 💡 只有更動庫存時才會更新 last_updated
-    });
-
-    if (actualDelta < 0) {
-      const consumed = Math.abs(actualDelta);
-      await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'usage_logs'), {
-        item_id: item.id,
-        item_name: item.display_name,
-        consumed_qty: consumed,
-        unit: item.unit || '件',
-        logged_at: serverTimestamp(),
-        previous_stock: currentStock,
-        previous_last_updated: previousLastUpdated || null
-      });
-      showToast(`已記錄消耗 ${consumed} ${item.unit || '件'}`);
-    }
   };
 
   const handleConfirmAdjustment = async () => {
@@ -362,52 +446,108 @@ const App = () => {
       showToast('請輸入有效的數字');
       return;
     }
-    const delta = Number((newStock - item.current_stock).toFixed(2));
-    if (delta === 0) {
-      setAdjustStockModal(null);
-      return;
+    
+    try {
+      const itemRef = doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', item.id);
+      
+      await runTransaction(db, async (transaction) => {
+        const sfDoc = await transaction.get(itemRef);
+        if (!sfDoc.exists()) throw new Error("物品不存在！");
+        
+        const currentStock = Number(sfDoc.data().current_stock) || 0;
+        const previousLastUpdated = sfDoc.data().last_updated;
+        const delta = Number((newStock - currentStock).toFixed(2));
+        
+        if (delta === 0) return;
+
+        transaction.update(itemRef, {
+          current_stock: newStock,
+          last_updated: serverTimestamp()
+        });
+
+        if (delta < 0) {
+          const consumed = Math.abs(delta);
+          const usageLogRef = doc(collection(db, 'artifacts', appId, 'users', user.uid, 'usage_logs'));
+          transaction.set(usageLogRef, {
+            item_id: item.id,
+            item_name: item.display_name,
+            consumed_qty: consumed,
+            unit: item.unit || '件',
+            logged_at: serverTimestamp(),
+            previous_stock: currentStock,
+            previous_last_updated: previousLastUpdated || null
+          });
+        }
+      });
+      
+      const diff = Number((newStock - item.current_stock).toFixed(2));
+      if (diff < 0) {
+        showToast(`已記錄消耗 ${Math.abs(diff)} ${item.unit || '件'}`);
+      } else if (diff > 0) {
+        showToast(`庫存已增加 ${diff} ${item.unit || '件'}`);
+      }
+    } catch (e) {
+      showToast('更新失敗：' + e.message);
     }
-    await updateStock(item.id, delta);
+
     setAdjustStockModal(null);
   };
 
-  const handleDeleteUsageLog = async (log) => {
-    await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'usage_logs', log.id));
+  const saveUsageLogEdit = async (log) => {
+    const newQty = Number(editingLogQty);
+    if (isNaN(newQty) || newQty <= 0) { showToast('請輸入有效的數字'); return; }
     
-    const itemToRestore = items.find(i => i.id === log.item_id);
-    if (itemToRestore) {
-      const restoredStock = Number((Number(itemToRestore.current_stock) + Number(log.consumed_qty)).toFixed(2));
-      const updatePayload = { current_stock: restoredStock };
-      
-      if (log.previous_last_updated !== undefined) {
-        updatePayload.last_updated = log.previous_last_updated;
-      }
-      await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', log.item_id), updatePayload);
+    try {
+      await runTransaction(db, async (transaction) => {
+        const logRef = doc(db, 'artifacts', appId, 'users', user.uid, 'usage_logs', log.id);
+        const itemRef = doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', log.item_id);
+        
+        const logDoc = await transaction.get(logRef);
+        const itemDoc = await transaction.get(itemRef);
+        
+        if (!logDoc.exists() || !itemDoc.exists()) throw new Error("資料同步失敗");
+        
+        const oldQty = Number(logDoc.data().consumed_qty);
+        const delta = Number((oldQty - newQty).toFixed(2)); 
+        
+        transaction.update(logRef, { consumed_qty: newQty });
+        
+        if (delta !== 0) {
+          const currentItemStock = Number(itemDoc.data().current_stock) || 0;
+          transaction.update(itemRef, {
+            current_stock: Math.max(0, Number((currentItemStock + delta).toFixed(2)))
+          });
+        }
+      });
+      showToast('消耗紀錄已更新，並同步修正庫存');
+    } catch (e) {
+      showToast('更新失敗');
     }
-    showToast('已刪除紀錄，庫存與更新日期已還原');
+    setEditingLogId(null);
   };
 
-  const saveUsageLogEdit = async (log) => {
-    const qty = Number(editingLogQty);
-    if (isNaN(qty) || qty <= 0) { showToast('請輸入有效的數字'); return; }
-    
-    const oldQty = Number(log.consumed_qty);
-    const delta = Number((oldQty - qty).toFixed(2)); 
-    
-    await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'usage_logs', log.id), {
-      consumed_qty: qty
-    });
-    
-    const itemToRestore = items.find(i => i.id === log.item_id);
-    if (itemToRestore && delta !== 0) {
-       const newStock = Math.max(0, Number((Number(itemToRestore.current_stock) + delta).toFixed(2)));
-       await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', itemToRestore.id), {
-         current_stock: newStock
-       });
+  const handleDeleteUsageLog = async (log) => {
+    try {
+      await runTransaction(db, async (transaction) => {
+        const logRef = doc(db, 'artifacts', appId, 'users', user.uid, 'usage_logs', log.id);
+        const itemRef = doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', log.item_id);
+        
+        const itemDoc = await transaction.get(itemRef);
+        transaction.delete(logRef);
+        
+        if (itemDoc.exists()) {
+          const restoredStock = Number((Number(itemDoc.data().current_stock) + Number(log.consumed_qty)).toFixed(2));
+          const updatePayload = { current_stock: restoredStock };
+          if (log.previous_last_updated !== undefined) {
+            updatePayload.last_updated = log.previous_last_updated;
+          }
+          transaction.update(itemRef, updatePayload);
+        }
+      });
+      showToast('已刪除紀錄，庫存與更新日期已還原');
+    } catch (e) {
+      showToast('刪除還原失敗');
     }
-    
-    setEditingLogId(null);
-    showToast('消耗紀錄已更新，並同步修正庫存');
   };
 
   const processImageWithAI = async (base64Image) => {
@@ -500,12 +640,11 @@ const App = () => {
         await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'inventory'), {
           display_name: itemForm.name.trim(), category: itemForm.category, unit: itemForm.unit || '件',
           current_stock: finalStock, min_stock: finalMin,
-          in_shopping_list: false, track_price: itemForm.track_price || false, last_updated: serverTimestamp()
+          in_shopping_list: false, shopping_qty: 1, track_price: itemForm.track_price || false, last_updated: serverTimestamp()
         });
         showToast('已新增品項');
       }
     } else if (modalMode === 'edit') {
-      // 💡 修復：編輯模式不更新 last_updated，避免干擾消耗預測
       await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', itemForm.id), {
         display_name: itemForm.name.trim(), category: itemForm.category, unit: itemForm.unit || '件',
         min_stock: finalMin, track_price: itemForm.track_price || false
@@ -539,14 +678,14 @@ const App = () => {
     await proceedToSaveItemForm();
   };
 
-  const openModal = (mode, item = null) => {
+  const openModal = useCallback((mode, item = null) => {
     setModalMode(mode);
     if (mode === 'add') {
       setItemForm({ id: null, name: '', category: filterCats.length === 1 ? filterCats[0] : (allCategoryNames[0] || '未分類'), unit: '件', stock: '1', min: String(userSettings.defaultMinStock), track_price: false });
     } else if (mode === 'edit' && item) {
       setItemForm({ id: item.id, name: item.display_name, category: item.category, unit: item.unit || '件', stock: String(item.current_stock), min: String(item.min_stock), track_price: item.track_price || false });
     }
-  };
+  }, [filterCats, allCategoryNames, userSettings.defaultMinStock]);
 
   const triggerDelete = (title, message, deleteAction) => {
     setConfirmDialog({ 
@@ -555,14 +694,23 @@ const App = () => {
     });
   };
 
-  const toggleShoppingList = async (id, status) => {
-    await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', id), { in_shopping_list: status });
+  const toggleShoppingList = useCallback(async (id, status, itemData) => {
+    const payload = { in_shopping_list: status };
+    if (status && itemData) {
+      payload.shopping_qty = Math.max(1, Math.ceil(Number(itemData.min_stock || 1) * 2 - Number(itemData.current_stock || 0)));
+    }
+    await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', id), payload);
     if(status) showToast('已放入採購單');
+  }, [user]);
+
+  const updateShoppingQty = async (id, newQty) => {
+    if (newQty < 1) return;
+    await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', id), { shopping_qty: newQty });
   };
 
   const confirmPurchase = async (item) => {
     if (!user) return;
-    const qty = Math.round(purchaseAmounts[item.id] || 1); // 確保購入為整數
+    const qty = Math.round(item.shopping_qty || 1); 
     await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', item.id), {
       current_stock: Number((item.current_stock + qty).toFixed(2)), in_shopping_list: false, last_updated: serverTimestamp()
     });
@@ -586,40 +734,50 @@ const App = () => {
       setEditingCatId(null); setEditingCatName(''); return;
     }
     
+    const batch = writeBatch(db);
     const catDocs = categories.filter(c => c.name === oldName);
     if (catDocs.length > 0) {
-      for (const c of catDocs) {
-        await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'categories', c.id), { name: newName });
-      }
+      catDocs.forEach(c => batch.update(doc(db, 'artifacts', appId, 'users', user.uid, 'categories', c.id), { name: newName }));
     } else {
-      await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'categories'), { name: newName, created_at: serverTimestamp() });
+      const newCatRef = doc(collection(db, 'artifacts', appId, 'users', user.uid, 'categories'));
+      batch.set(newCatRef, { name: newName, created_at: serverTimestamp() });
     }
 
     const itemsToUpdate = items.filter(i => i.category === oldName);
-    for (const item of itemsToUpdate) {
-      await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', item.id), { category: newName });
-    }
+    itemsToUpdate.forEach(item => {
+      batch.update(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', item.id), { category: newName });
+    });
 
+    await batch.commit();
     setEditingCatId(null); setEditingCatName('');
     showToast('分類已更新');
   };
 
   const handleDeleteCategory = async (catName) => {
+    const batch = writeBatch(db);
     const catDocs = categories.filter(c => c.name === catName);
-    for (const c of catDocs) {
-      await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'categories', c.id));
-    }
+    catDocs.forEach(c => batch.delete(doc(db, 'artifacts', appId, 'users', user.uid, 'categories', c.id)));
     
     const itemsToUpdate = items.filter(i => i.category === catName);
-    for (const item of itemsToUpdate) {
-      await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', item.id), { category: '未分類' });
-    }
+    itemsToUpdate.forEach(item => {
+      batch.update(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', item.id), { category: '未分類' });
+    });
+    
+    await batch.commit();
     showToast('分類已刪除');
   };
 
   const fetchDailyDeals = async () => {
     const itemsToQuery = items.filter(i => i.track_price);
     if (itemsToQuery.length === 0) { showToast("沒有設定追蹤特價的物品。"); return; }
+    if (itemsToQuery.length > 15) { 
+      setConfirmDialog({
+        title: '追蹤物品過多',
+        message: `您目前設定了 ${itemsToQuery.length} 個特價追蹤物品。\n為了確保 AI 分析的速度與準確性，請將追蹤數量限制在 15 個以內。`,
+        cancelText: '關閉'
+      });
+      return;
+    }
     
     setIsSearchingDeals(true);
     try {
@@ -679,6 +837,33 @@ const App = () => {
     }
   };
 
+  const handleResetPriceTracking = () => {
+    const itemsToUntrack = items.filter(i => i.track_price);
+    if (itemsToUntrack.length === 0) {
+      showToast('目前沒有任何追蹤中的物品');
+      return;
+    }
+    setConfirmDialog({
+      title: '清空特價追蹤',
+      message: `確定要取消追蹤這 ${itemsToUntrack.length} 個物品的特價嗎？`,
+      confirmText: '確定清空',
+      cancelText: '取消',
+      onConfirm: async () => {
+        try {
+          const batch = writeBatch(db);
+          itemsToUntrack.forEach(item => {
+            batch.update(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', item.id), { track_price: false });
+          });
+          await batch.commit();
+          showToast('已取消所有特價追蹤');
+        } catch(e) {
+          showToast('清空失敗');
+        }
+        setConfirmDialog(null);
+      }
+    });
+  };
+
   const generateAiAdvice = async () => {
     if (!user) return;
     setIsGeneratingAdvice(true);
@@ -694,12 +879,6 @@ const App = () => {
     } catch (err) { 
       showToast(`AI 分析失敗`); 
     } finally { setIsGeneratingAdvice(false); }
-  };
-
-  const formatDate = (ts) => {
-    if (!ts || !ts.seconds) return "---";
-    const d = new Date(ts.seconds * 1000);
-    return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
   };
 
   if (authChecking) return <div className="min-h-screen flex items-center justify-center bg-slate-50"><Loader2 className="animate-spin text-indigo-600" size={40} /></div>;
@@ -765,7 +944,9 @@ const App = () => {
             <p className="text-sm text-slate-500 mb-6 leading-relaxed whitespace-pre-wrap">{confirmDialog.message}</p>
             <div className="flex gap-3">
               <button onClick={() => setConfirmDialog(null)} className="flex-1 bg-slate-100 text-slate-600 py-3.5 rounded-xl font-bold">{confirmDialog.cancelText || '取消'}</button>
-              <button onClick={confirmDialog.onConfirm} className="flex-1 bg-indigo-600 text-white py-3.5 rounded-xl font-bold shadow-md">{confirmDialog.confirmText || '確定'}</button>
+              {confirmDialog.onConfirm && (
+                <button onClick={confirmDialog.onConfirm} className="flex-1 bg-indigo-600 text-white py-3.5 rounded-xl font-bold shadow-md">{confirmDialog.confirmText || '確定'}</button>
+              )}
             </div>
           </div>
         </div>
@@ -862,7 +1043,7 @@ const App = () => {
             <div className="bg-white rounded-3xl p-5 w-full max-w-sm shadow-2xl relative max-h-[80vh] flex flex-col">
                <button onClick={() => setIsUsageLogsOpen(false)} className="absolute top-4 right-4 text-slate-400"><X size={18}/></button>
                <h3 className="text-lg font-black mb-1 flex items-center gap-2 text-indigo-600"><Database size={18}/> 消耗紀錄管理</h3>
-               <p className="text-[10px] text-slate-500 mb-4 border-b pb-3 border-slate-100">刪除錯誤的紀錄，以免影響 AI 預測準確度。</p>
+               <p className="text-[10px] text-slate-500 mb-4 border-b pb-3 border-slate-100">刪除錯誤的紀錄，系統將會自動將數量與日期還原至原狀。</p>
                
                <div className="overflow-y-auto space-y-2 flex-1 pr-1">
                   {usageLogs.length === 0 && <p className="text-xs text-center text-slate-400 py-6">尚無任何消耗紀錄</p>}
@@ -905,7 +1086,7 @@ const App = () => {
         {activeTab === 'inventory' && (
           <div className="space-y-4">
             
-            {/* 🌟 多重分類過濾器 */}
+            {/* 🌟 完美的自訂多重分類過濾器 (Inventory) */}
             <div className="flex gap-2">
               <div className="relative flex-1 z-40">
                 <button onClick={() => setIsFilterOpen(!isFilterOpen)} className="w-full flex items-center justify-between bg-white rounded-xl border border-slate-200 px-3 py-2.5 shadow-sm text-xs font-bold text-slate-700 outline-none">
@@ -960,44 +1141,13 @@ const App = () => {
             {displayedItems.length > 0 ? (
               <div className="grid grid-cols-2 gap-3">
                 {displayedItems.map(item => (
-                  <div key={item.id} className={`col-span-1 bg-white rounded-2xl p-3 shadow-sm border transition-all flex flex-col h-full min-h-[145px] justify-between ${item.current_stock <= item.min_stock ? 'border-orange-200 ring-1 ring-orange-100' : 'border-slate-100'}`}>
-                    
-                    <div>
-                       <div className="flex justify-between items-start gap-1">
-                         <h3 className="font-bold text-slate-800 text-sm leading-tight line-clamp-2" title={item.display_name}>{item.display_name}</h3>
-                         <button onClick={() => openModal('edit', item)} className="text-slate-300 hover:text-indigo-500 p-1 -mt-1 -mr-1 shrink-0"><Edit3 size={14}/></button>
-                       </div>
-                       
-                       <div className="flex flex-wrap gap-1 mt-1 mb-2">
-                         <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded font-bold truncate max-w-[60px]">{item.category}</span>
-                         {item.track_price && <span className="text-[9px] bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded font-bold flex items-center"><DollarSign size={8}/></span>}
-                         {item.current_stock <= item.min_stock && <span className="text-[9px] bg-orange-50 text-orange-600 px-1.5 py-0.5 rounded font-bold flex items-center"><AlertTriangle size={8}/> 低庫存</span>}
-                       </div>
-                    </div>
-
-                    <div className="mt-auto pt-2 border-t border-slate-50 flex flex-col gap-1.5">
-                       <span className="text-[9px] text-slate-400 flex items-center gap-0.5 w-full truncate" title="最後更新">
-                         <Clock size={9} className="shrink-0"/> 
-                         <span className="truncate">{formatDate(item.last_updated)}</span>
-                       </span>
-                       <div className="flex gap-1.5 items-center justify-between w-full">
-                         <button 
-                           onClick={() => { setAdjustStockModal(item); setAdjustAmount(String(item.current_stock)); }} 
-                           className="flex-1 bg-slate-50 hover:bg-indigo-50 border border-slate-100 rounded-lg px-2 py-1.5 flex flex-row items-baseline justify-center transition-colors shadow-sm active:scale-95 gap-1 overflow-hidden"
-                         >
-                           <span className={`font-black text-base truncate ${item.current_stock <= item.min_stock ? 'text-orange-500' : 'text-slate-800'}`}>{item.current_stock}</span>
-                           <span className="text-[10px] font-bold text-slate-500 truncate">{item.unit || '件'}</span>
-                         </button>
-
-                         <button 
-                           onClick={() => toggleShoppingList(item.id, !item.in_shopping_list)} 
-                           className={`w-8 h-8 shrink-0 flex items-center justify-center rounded-lg transition-colors ${item.in_shopping_list ? 'bg-emerald-50 text-emerald-500' : 'bg-slate-50 text-slate-400 hover:bg-indigo-50 hover:text-indigo-500'}`}
-                         >
-                           {item.in_shopping_list ? <CheckCircle2 size={16}/> : <ShoppingCart size={16}/>}
-                         </button>
-                       </div>
-                    </div>
-                  </div>
+                  <ItemCard 
+                    key={item.id} 
+                    item={item} 
+                    onEdit={openModal.bind(null, 'edit')} 
+                    onAdjust={(i) => { setAdjustStockModal(i); setAdjustAmount(String(i.current_stock)); }}
+                    onToggleShopping={toggleShoppingList}
+                  />
                 ))}
               </div>
             ) : (
@@ -1009,20 +1159,19 @@ const App = () => {
           </div>
         )}
 
-        {/* --- 分析與追蹤分頁 --- */}
-        {activeTab === 'analysis' && (
+        {/* =====================================================================
+            🌟 分頁 2：獨立的用量預測分頁
+            ===================================================================== */}
+        {activeTab === 'prediction' && (
           <div className="space-y-4 animate-in fade-in">
-            
-            {/* 📊 數據驅動用量分析 */}
             <div className="bg-white rounded-3xl p-5 shadow-sm border border-slate-100">
                <div className="flex items-center justify-between mb-3">
                   <h3 className="font-black flex items-center gap-1.5 text-slate-800"><LineChart size={16} className="text-indigo-500"/> 智慧用量預測</h3>
-                  <button onClick={() => setIsUsageLogsOpen(true)} className="text-[9px] text-indigo-500 font-bold bg-indigo-50 px-2 py-1 rounded-md flex items-center gap-1"><Database size={10}/> 紀錄</button>
+                  <button onClick={() => setIsUsageLogsOpen(true)} className="text-[9px] text-indigo-500 font-bold bg-indigo-50 px-2 py-1 rounded-md flex items-center gap-1"><Database size={10}/> 紀錄管理</button>
                </div>
-               <p className="text-[10px] text-slate-500 mb-3 leading-relaxed">系統會根據您手動扣除庫存的「實際消耗紀錄」，推算未來耗盡日期。</p>
+               <p className="text-[10px] text-slate-500 mb-3 leading-relaxed">系統會根據「最舊的一筆紀錄」到「今天」的真實消耗天數，穩定推算未來耗盡日期。</p>
                
-               {/* 🌟 分析頁面多選過濾器 */}
-               {usageInsights.length > 0 && (
+               {rawUsageInsights.length > 0 && (
                  <div className="flex gap-2 mb-4">
                     <div className="relative flex-1 z-30">
                       <button onClick={() => setIsAnalysisFilterOpen(!isAnalysisFilterOpen)} className="w-full flex items-center justify-between bg-slate-50 rounded-lg border border-slate-100 px-2 py-1.5 text-[10px] font-bold text-slate-600 outline-none">
@@ -1083,7 +1232,7 @@ const App = () => {
                                {insight.status === 'critical' && <span className="bg-red-50 text-red-500 text-[8px] font-black px-1.5 py-0.5 rounded">即將用罄</span>}
                             </div>
                             {insight.status !== 'good' && !insight.in_shopping_list && (
-                               <button onClick={() => toggleShoppingList(insight.id, true)} className="text-[9px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-100 shadow-sm active:scale-95">加採購單</button>
+                               <button onClick={() => toggleShoppingList(insight.id, true, insight)} className="text-[9px] font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-100 shadow-sm active:scale-95">加採購單</button>
                             )}
                          </div>
                          
@@ -1095,14 +1244,14 @@ const App = () => {
                             <div className="text-right">
                                <p className="text-[9px] text-slate-400 mb-0.5">預計可用至</p>
                                <p className={`font-black text-sm leading-none ${insight.status === 'critical' ? 'text-red-500' : insight.status === 'warning' ? 'text-orange-500' : 'text-emerald-500'}`}>
-                                  {insight.daysLeft > 900 ? '存量充足' : insight.depletionDateString} <span className="text-[9px] font-bold">({insight.daysLeft > 900 ? '900+ 天' : `剩 ${insight.daysLeft} 天`})</span>
+                                  {insight.daysLeft > 900 ? '存量充足' : insight.depletionDateString} <span className="text-[9px] font-bold">({insight.daysLeft > 900 ? '900+ 天' : (insight.daysLeft === 0 ? '已耗盡' : `剩 ${insight.daysLeft} 天`)})</span>
                                </p>
                             </div>
                          </div>
                       </div>
                    ))}
                  </div>
-               ) : usageInsights.length > 0 ? (
+               ) : rawUsageInsights.length > 0 ? (
                  <p className="text-xs text-center text-slate-400 py-4">無符合條件的預測資料</p>
                ) : (
                  <div className="bg-slate-50 border border-dashed border-slate-200 rounded-xl p-6 text-center">
@@ -1110,11 +1259,21 @@ const App = () => {
                  </div>
                )}
             </div>
+          </div>
+        )}
 
+        {/* =====================================================================
+            分頁 3：智慧助手 (原分析與追蹤)
+            ===================================================================== */}
+        {activeTab === 'analysis' && (
+          <div className="space-y-4 animate-in fade-in">
             <div className="bg-slate-900 rounded-3xl p-5 shadow-xl text-white">
                <div className="flex items-center justify-between mb-3">
                  <h3 className="font-black flex items-center gap-1.5 text-yellow-400"><Zap size={16} className="fill-yellow-400"/> 每日特價快報</h3>
-                 <span className="text-[9px] text-slate-400 flex items-center gap-1"><Clock size={10}/> {dailyDeals?.updated_at ? formatDate(dailyDeals.updated_at) : '尚未更新'}</span>
+                 <div className="flex items-center gap-2">
+                    <span className="text-[9px] text-slate-400 flex items-center gap-1"><Clock size={10}/> {dailyDeals?.updated_at ? formatDate(dailyDeals.updated_at) : '尚未更新'}</span>
+                    <button onClick={handleResetPriceTracking} className="text-[9px] bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-0.5 rounded border border-slate-700 transition-colors">清空追蹤</button>
+                 </div>
                </div>
                
                <div className="flex items-center gap-2 mb-4 bg-white/5 p-1.5 rounded-lg border border-white/10">
@@ -1170,7 +1329,7 @@ const App = () => {
                               </button>
                               
                               {linkedItem && !linkedItem.in_shopping_list && (
-                                 <button onClick={() => toggleShoppingList(linkedItem.id, true)} className="bg-indigo-500 text-white px-2 py-1 rounded text-[9px] font-black flex items-center gap-0.5 shadow-md active:scale-95"><ShoppingCart size={10}/> 加採購單</button>
+                                 <button onClick={() => toggleShoppingList(linkedItem.id, true, linkedItem)} className="bg-indigo-500 text-white px-2 py-1 rounded text-[9px] font-black flex items-center gap-0.5 shadow-md active:scale-95"><ShoppingCart size={10}/> 加採購單</button>
                               )}
                               {linkedItem && linkedItem.in_shopping_list && (
                                  <span className="text-[9px] text-emerald-400 flex items-center gap-0.5"><CheckCircle2 size={10}/> 已在清單</span>
@@ -1201,7 +1360,7 @@ const App = () => {
             <div className="bg-indigo-600 rounded-3xl p-5 shadow-xl text-white relative overflow-hidden">
               <Sparkles className="absolute top-0 right-0 text-white/10 w-24 h-24 -mr-4 -mt-4" />
               <div className="relative z-10">
-                <h3 className="font-black flex items-center gap-1.5 mb-2 text-sm"><Zap size={14}/> 庫存管理與食譜</h3>
+                <h3 className="font-black flex items-center gap-1.5 mb-2 text-sm"><Sparkles size={14}/> AI 庫存管理與食譜</h3>
                 {isGeneratingAdvice ? (
                   <div className="flex items-center gap-2 text-xs text-indigo-100"><Loader2 className="animate-spin" size={14}/> 分析中...</div>
                 ) : aiAdvice ? (
@@ -1217,7 +1376,9 @@ const App = () => {
           </div>
         )}
 
-        {/* --- 採購單分頁 --- */}
+        {/* =====================================================================
+            分頁 4：採購單
+            ===================================================================== */}
         {activeTab === 'shopping' && (
           <div className="space-y-4 animate-in fade-in">
             <h2 className="text-xs font-bold text-slate-400 px-1 uppercase tracking-widest">待辦採購</h2>
@@ -1235,9 +1396,9 @@ const App = () => {
                     <div className="flex items-center gap-1.5">
                        <span className="text-[10px] font-bold text-indigo-700 ml-1">購入:</span>
                        <div className="flex items-center gap-1 bg-white rounded-lg p-0.5 border border-indigo-100">
-                         <button onClick={() => setPurchaseAmounts({...purchaseAmounts, [item.id]: Math.max(1, Math.round(purchaseAmounts[item.id]||1)-1)})} className="p-1 text-indigo-400"><Minus size={14}/></button>
-                         <span className="text-sm font-black text-indigo-700 w-5 text-center">{Math.round(purchaseAmounts[item.id] || 1)}</span>
-                         <button onClick={() => setPurchaseAmounts({...purchaseAmounts, [item.id]: Math.round(purchaseAmounts[item.id]||1)+1})} className="p-1 text-indigo-400"><Plus size={14}/></button>
+                         <button onClick={() => updateShoppingQty(item.id, Math.max(1, Math.round(item.shopping_qty||1)-1))} className="p-1 text-indigo-400"><Minus size={14}/></button>
+                         <span className="text-sm font-black text-indigo-700 w-5 text-center">{Math.round(item.shopping_qty || 1)}</span>
+                         <button onClick={() => updateShoppingQty(item.id, Math.round(item.shopping_qty||1)+1)} className="p-1 text-indigo-400"><Plus size={14}/></button>
                        </div>
                        <span className="text-[10px] font-bold text-indigo-600">{item.unit || '件'}</span>
                     </div>
@@ -1267,7 +1428,7 @@ const App = () => {
           </div>
         )}
 
-        {/* --- 共用新增/編輯 Modal z-50 --- */}
+        {/* --- 🌟 共用新增/編輯 Modal (加入重設按鈕) --- */}
         {modalMode && (
           <div className="fixed inset-0 z-[90] bg-black/60 backdrop-blur-sm flex items-end sm:items-center p-0 sm:p-4 animate-in fade-in">
              <div className="bg-white rounded-t-3xl sm:rounded-3xl p-5 w-full max-w-sm relative max-h-[90vh] overflow-y-auto animate-in slide-in-from-bottom-full duration-300 mx-auto">
@@ -1310,13 +1471,21 @@ const App = () => {
                           </div>
                         </div>
                       )}
-                      <div className="flex-1">
+                      <div className="flex-1 flex flex-col justify-end">
                         <label className="text-[10px] font-bold text-orange-500 mb-1 block text-center">警戒 ({itemForm.unit})</label>
                         <div className="flex items-center justify-between bg-orange-50 rounded-xl p-1.5 border border-orange-100">
                           <button onClick={() => setItemForm({...itemForm, min: String(Math.max(0, Number((Number(itemForm.min)-0.5).toFixed(2))))})} className="p-2 text-orange-400"><Minus size={16}/></button>
                           <input type="number" step="0.1" value={itemForm.min} onChange={e => setItemForm({...itemForm, min: e.target.value})} className="font-bold text-lg text-orange-600 w-12 text-center bg-transparent outline-none" />
                           <button onClick={() => setItemForm({...itemForm, min: String(Number((Number(itemForm.min)+0.5).toFixed(2)))})} className="p-2 text-orange-400"><Plus size={16}/></button>
                         </div>
+                        {modalMode === 'edit' && rawUsageInsights.find(i => i.id === itemForm.id)?.suggestedMinStock > 0 && (
+                          <div 
+                            className="mt-1.5 text-[9px] text-center text-indigo-600 bg-indigo-50 border border-indigo-100 rounded py-1 px-1 cursor-pointer active:scale-95 transition-transform"
+                            onClick={() => setItemForm({...itemForm, min: String(rawUsageInsights.find(i => i.id === itemForm.id).suggestedMinStock)})}
+                          >
+                            💡 建議設為 {rawUsageInsights.find(i => i.id === itemForm.id).suggestedMinStock} (一週量)
+                          </div>
+                        )}
                       </div>
                    </div>
                    <div className="flex items-center justify-between bg-slate-50 p-3 rounded-xl border border-slate-200">
@@ -1328,17 +1497,25 @@ const App = () => {
 
                    <button onClick={saveItemForm} className="w-full bg-indigo-600 text-white py-3.5 rounded-xl font-bold text-sm shadow-md active:scale-95">確認儲存</button>
                    
-                   {/* 刪除按鈕 */}
+                   {/* 🌟 編輯模式的危險操作區 (重設與刪除) */}
                    {modalMode === 'edit' && (
-                     <button 
-                       onClick={() => triggerDelete('刪除物品', `確定要永久刪除「${itemForm.name}」嗎？`, () => {
-                         deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', itemForm.id));
-                         setModalMode(null);
-                       })} 
-                       className="w-full mt-2 bg-red-50 text-red-600 py-3.5 rounded-xl font-bold text-sm border border-red-100 active:bg-red-100 flex items-center justify-center gap-1"
-                     >
-                       <Trash2 size={16}/> 刪除此物品
-                     </button>
+                     <div className="grid grid-cols-2 gap-2 mt-2">
+                       <button 
+                         onClick={() => handleResetItemData(itemForm.id)} 
+                         className="w-full bg-orange-50 text-orange-600 py-3.5 rounded-xl font-bold text-sm border border-orange-100 active:bg-orange-100 flex items-center justify-center gap-1"
+                       >
+                         <RotateCcw size={16}/> 重設紀錄
+                       </button>
+                       <button 
+                         onClick={() => triggerDelete('刪除物品', `確定要永久刪除「${itemForm.name}」嗎？`, () => {
+                           deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', itemForm.id));
+                           setModalMode(null);
+                         })} 
+                         className="w-full bg-red-50 text-red-600 py-3.5 rounded-xl font-bold text-sm border border-red-100 active:bg-red-100 flex items-center justify-center gap-1"
+                       >
+                         <Trash2 size={16}/> 刪除物品
+                       </button>
+                     </div>
                    )}
                 </div>
              </div>
@@ -1420,9 +1597,13 @@ const App = () => {
           <Package size={22} strokeWidth={activeTab === 'inventory' ? 2.5 : 2}/>
           <span className="text-[9px] font-black mt-1">儲藏室</span>
         </button>
+        <button onClick={() => setActiveTab('prediction')} className={`flex flex-col items-center justify-center w-full py-2.5 transition-all ${activeTab === 'prediction' ? 'text-indigo-600' : 'text-slate-400'}`}>
+          <LineChart size={22} strokeWidth={activeTab === 'prediction' ? 2.5 : 2}/>
+          <span className="text-[9px] font-black mt-1">用量預測</span>
+        </button>
         <button onClick={() => setActiveTab('analysis')} className={`flex flex-col items-center justify-center w-full py-2.5 transition-all ${activeTab === 'analysis' ? 'text-indigo-600' : 'text-slate-400'}`}>
-          <TrendingUp size={22} strokeWidth={activeTab === 'analysis' ? 2.5 : 2}/>
-          <span className="text-[9px] font-black mt-1">分析與追蹤</span>
+          <Zap size={22} strokeWidth={activeTab === 'analysis' ? 2.5 : 2}/>
+          <span className="text-[9px] font-black mt-1">智慧助手</span>
         </button>
         <button onClick={() => setActiveTab('shopping')} className={`flex flex-col items-center justify-center w-full py-2.5 relative transition-all ${activeTab === 'shopping' ? 'text-indigo-600' : 'text-slate-400'}`}>
           <div className="relative">
